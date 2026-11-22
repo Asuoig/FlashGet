@@ -16,7 +16,7 @@
 ## 📂 目录结构说明
 
 ```text
-multithread_downloader/
+FlashGet/
 │
 ├── FlashGet.exe            # 🌟 主程序：最新单文件免安装绿色版（开箱即用）
 │
@@ -26,7 +26,6 @@ multithread_downloader/
 │   ├── popup.html / js     # 扩展快捷开关与连接状态面板
 │   └── icons/              # 扩展高清图标
 │
-├── releases/               # 📦 历史版本归档目录
 ├── tests/                  # 🧪 核心引擎与界面单元测试
 ├── engine.py               # 多线程并发与协议探测核心引擎
 ├── gui.py                  # Tkinter 原生桌面端界面实现
@@ -40,7 +39,7 @@ multithread_downloader/
 ## 🛠️ 快速使用指南
 
 ### 1. 运行主程序
-直接双击运行根目录下的 [FlashGet.exe](file:///C:/Users/Fang/.gemini/antigravity/scratch/multithread_downloader/FlashGet.exe)。
+从 [Releases](https://github.com/Asuoig/FlashGet/releases) 下载最新版 `FlashGet.exe`，双击即可运行。
 
 ### 2. 启用浏览器接管（仅需 10 秒）
 1. 打开 Edge 或 Chrome 地址栏访问：`edge://extensions/` 或 `chrome://extensions/`
