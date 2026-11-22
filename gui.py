@@ -242,17 +242,34 @@ class FlashGetApp(tk.Tk):
             def log_message(self, format, *args):
                 pass  # Silence standard console logs
 
-            def do_OPTIONS(self):
-                self.send_response(200)
-                self.send_header("Access-Control-Allow-Origin", "*")
+            def _is_allowed_origin(self):
+                """只允许来自 Chrome/Edge 扩展的请求"""
+                origin = self.headers.get("Origin", "")
+                if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
+                    return True
+                # 允许无 Origin 的本机请求（如 curl 本地调试）
+                if not origin:
+                    return True
+                return False
+
+            def _send_cors_headers(self):
+                origin = self.headers.get("Origin", "")
+                if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                else:
+                    self.send_header("Access-Control-Allow-Origin", "null")
                 self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+            def do_OPTIONS(self):
+                self.send_response(200)
+                self._send_cors_headers()
                 self.end_headers()
 
             def do_GET(self):
                 if self.path == "/ping":
                     self.send_response(200)
-                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self._send_cors_headers()
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(b'{"status":"ok","app":"FlashGet"}')
@@ -262,6 +279,12 @@ class FlashGetApp(tk.Tk):
 
             def do_POST(self):
                 if self.path == "/download":
+                    # CSRF 防护：拒绝来自非扩展网页的请求
+                    if not self._is_allowed_origin():
+                        self.send_response(403)
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"forbidden: invalid origin"}')
+                        return
                     try:
                         content_len = int(self.headers.get("Content-Length", 0))
                         post_body = self.rfile.read(content_len)
@@ -276,13 +299,13 @@ class FlashGetApp(tk.Tk):
                             app_ref.after(0, lambda: app_ref._handle_browser_download(url, filename, cookies, referer))
 
                         self.send_response(200)
-                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self._send_cors_headers()
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
                         self.wfile.write(b'{"status":"accepted"}')
                     except Exception as err:
                         self.send_response(500)
-                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self._send_cors_headers()
                         self.end_headers()
                         self.wfile.write(str(err).encode("utf-8"))
                 else:
@@ -294,7 +317,7 @@ class FlashGetApp(tk.Tk):
                 server = HTTPServer(("127.0.0.1", 9666), BridgeHandler)
                 server.serve_forever()
             except Exception as e:
-                print(f"[IDM Bridge] Could not start server on port 9666: {e}")
+                print(f"[FlashGet Bridge] Could not start server on port 9666: {e}")
 
         server_th = threading.Thread(target=run_server, daemon=True)
         server_th.start()
@@ -1097,6 +1120,17 @@ class FlashGetApp(tk.Tk):
         if not task.file_path or not os.path.exists(task.file_path):
             messagebox.showwarning("提示", f"本地文件不存在或尚未下载完成！\n路径: {task.file_path}")
             return
+
+        # 安全检查：危险可执行文件类型需要用户确认
+        DANGEROUS_EXTS = {'.exe', '.bat', '.cmd', '.vbs', '.ps1', '.reg', '.msi',
+                         '.com', '.scr', '.pif', '.wsf', '.js', '.jse', '.vbe'}
+        _, ext = os.path.splitext(task.file_path)
+        if ext.lower() in DANGEROUS_EXTS:
+            if not messagebox.askyesno("⚠️ 安全提示",
+                    f"该文件为可执行程序（{ext}），运行来路不明的可执行文件可能存在安全风险。\n\n确认要运行吗？",
+                    icon="warning", parent=self):
+                return
+
         if sys.platform == "win32":
             os.startfile(task.file_path)
         else:
@@ -1125,26 +1159,34 @@ class FlashGetApp(tk.Tk):
     def open_settings_dialog(self):
         dialog = tk.Toplevel(self)
         dialog.title("⚙️ FlashGet (快车) 配置选项")
-        center_window_on_parent(dialog, self, 420, 240)
+        center_window_on_parent(dialog, self, 460, 360)
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
 
         set_window_dark_titlebar(dialog, self.theme["is_dark"])
 
-        pad_f = tk.Frame(dialog, padx=14, pady=14)
+        pad_f = tk.Frame(dialog, padx=16, pady=16)
         pad_f.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(pad_f, text="界面主题风格:", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-        theme_box = tk.Frame(pad_f)
-        theme_box.pack(fill=tk.X, pady=(2, 8))
+        # 1. 底部按钮栏使用 side=BOTTOM 优先放置，确保不被上方内容挤出或遮挡
+        btn_bar = tk.Frame(pad_f)
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(12, 0))
+
+        # 2. 上方配置选项内容
+        content_f = tk.Frame(pad_f)
+        content_f.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(content_f, text="界面主题风格:", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        theme_box = tk.Frame(content_f)
+        theme_box.pack(fill=tk.X, pady=(2, 10))
         theme_v = tk.StringVar(value="暗黑主题 (Dark)" if self.current_theme_key == "dark" else "浅色主题 (Light)")
         theme_combo = ttk.Combobox(theme_box, textvariable=theme_v, values=["暗黑主题 (Dark)", "浅色主题 (Light)"], state="readonly", font=("Microsoft YaHei UI", 9))
         theme_combo.pack(anchor="w")
 
-        tk.Label(pad_f, text="默认文件保存目录:", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-        dir_box = tk.Frame(pad_f)
-        dir_box.pack(fill=tk.X, pady=(2, 8))
+        tk.Label(content_f, text="默认文件保存目录:", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        dir_box = tk.Frame(content_f)
+        dir_box.pack(fill=tk.X, pady=(2, 10))
         dir_v = tk.StringVar(value=self.default_save_dir)
         ttk.Entry(dir_box, textvariable=dir_v, font=("Microsoft YaHei UI", 9)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         def browse():
@@ -1153,9 +1195,9 @@ class FlashGetApp(tk.Tk):
                 dir_v.set(d)
         ttk.Button(dir_box, text="浏览...", command=browse).pack(side=tk.RIGHT)
 
-        tk.Label(pad_f, text="默认最大并发连接数 (线程数):", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        tk.Label(content_f, text="默认最大并发连接数 (线程数):", font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
         th_v = tk.IntVar(value=self.default_threads)
-        ttk.Spinbox(pad_f, from_=1, to=32, textvariable=th_v, width=10, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(2, 14))
+        ttk.Spinbox(content_f, from_=1, to=32, textvariable=th_v, width=10, font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=(2, 0))
 
         def save_conf():
             selected_th = "dark" if "暗黑" in theme_v.get() else "light"
@@ -1168,8 +1210,8 @@ class FlashGetApp(tk.Tk):
             dialog.destroy()
             messagebox.showinfo("设置", "设置保存成功！", parent=self)
 
-        ttk.Button(pad_f, text="确定", command=save_conf).pack(side=tk.RIGHT)
-        ttk.Button(pad_f, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btn_bar, text="确定", command=save_conf).pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=6)
 
 
 def main():
