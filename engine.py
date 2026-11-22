@@ -141,9 +141,13 @@ class DownloadEngine:
 
     def _init_network_openers(self):
         """Initialize SSL contexts and CookieJar-enabled openers with auto proxy fallback."""
+        # 默认使用安全 SSL 上下文（校验证书），仅在遇到证书错误时降级
         self.ssl_ctx = ssl.create_default_context()
-        self.ssl_ctx.check_hostname = False
-        self.ssl_ctx.verify_mode = ssl.CERT_NONE
+        # Fallback insecure context — only used after an SSL verification failure
+        self._insecure_ssl_ctx = ssl.create_default_context()
+        self._insecure_ssl_ctx.check_hostname = False
+        self._insecure_ssl_ctx.verify_mode = ssl.CERT_NONE
+        self._using_insecure_ssl = False
 
         # 1. Direct opener with CookieJar
         self.direct_opener = urllib.request.build_opener(
@@ -198,19 +202,37 @@ class DownloadEngine:
         return req
 
     def _open_url(self, req: urllib.request.Request, timeout: int = 15):
-        """Open URL with automatic direct-to-proxy fallback."""
-        if not self.use_proxy:
-            try:
-                return self.direct_opener.open(req, timeout=timeout)
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                # If direct connection timed out / was blocked and proxy is available, silently switch to proxy
+        """Open URL with automatic direct-to-proxy fallback and SSL certificate fallback."""
+        opener = self.proxy_opener if self.use_proxy else self.direct_opener
+        fallback_opener = None if self.use_proxy else self.proxy_opener
+
+        try:
+            return opener.open(req, timeout=timeout)
+        except ssl.SSLCertVerificationError:
+            # SSL 证书校验失败，降级到不校验模式并警告用户
+            if not self._using_insecure_ssl:
+                self._using_insecure_ssl = True
+                self.set_status(self.status, "⚠️ SSL证书校验失败，已降级为不验证模式（存在安全风险）")
+                # Rebuild openers with insecure context
+                self.direct_opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=self._insecure_ssl_ctx),
+                    urllib.request.HTTPCookieProcessor(self.cookie_jar)
+                )
                 if self.proxy_opener is not None:
-                    self.use_proxy = True
-                    self.set_status(self.status, "直连超时，已自动静默切换至系统代理重试...")
-                    return self.proxy_opener.open(req, timeout=timeout)
-                raise e
-        else:
-            return self.proxy_opener.open(req, timeout=timeout)
+                    system_proxies = urllib.request.getproxies()
+                    self.proxy_opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler(system_proxies),
+                        urllib.request.HTTPSHandler(context=self._insecure_ssl_ctx),
+                        urllib.request.HTTPCookieProcessor(self.cookie_jar)
+                    )
+            reopener = self.proxy_opener if self.use_proxy else self.direct_opener
+            return reopener.open(req, timeout=timeout)
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if fallback_opener is not None:
+                self.use_proxy = True
+                self.set_status(self.status, "直连超时，已自动静默切换至系统代理重试...")
+                return fallback_opener.open(req, timeout=timeout)
+            raise e
 
     def probe_resource(self) -> bool:
         """
@@ -283,6 +305,10 @@ class DownloadEngine:
                         self.filename = self.custom_filename or self._extract_filename(headers, self.url)
                     self.filename = self._sanitize_filename(self.filename)
                     self.final_file_path = os.path.join(self.save_dir, self.filename)
+                    # 安全检查：确保最终路径在保存目录内，防止路径穿越
+                    if not os.path.abspath(self.final_file_path).startswith(os.path.abspath(self.save_dir)):
+                        self.set_status("error", "文件名异常，存在路径穿越风险！")
+                        return False
                     self.meta_file_path = self.final_file_path + ".dmeta"
                     return True
             except Exception as e2:
@@ -296,7 +322,9 @@ class DownloadEngine:
             match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^";\n]+)["\']?', cd, re.IGNORECASE)
             if match:
                 fn = match.group(1).strip()
-                return urllib.parse.unquote(fn)
+                fn = urllib.parse.unquote(fn)
+                # 防止路径穿越：只取文件名部分
+                return os.path.basename(fn)
 
         parsed = urllib.parse.urlparse(url)
         path = urllib.parse.unquote(parsed.path)
@@ -306,6 +334,8 @@ class DownloadEngine:
         return "downloaded_file.bin"
 
     def _sanitize_filename(self, filename: str) -> str:
+        # 防止路径穿越：先强制取 basename
+        filename = os.path.basename(filename)
         invalid_chars = '<>:"/\\|?*\0'
         for ch in invalid_chars:
             filename = filename.replace(ch, "_")
