@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "FlashGet 快车极速下载接管扩展",
+  "name": "FlashGet 极速下载接管扩展",
   "version": "1.0.0",
-  "description": "自动拦截 Chrome / Edge 浏览器下载，无缝移交至 FlashGet (快车) 极速下载器进行多线程并发加速",
+  "description": "自动拦截 Chrome / Edge 浏览器下载，无缝移交至 FlashGet 极速下载器进行多线程并发加速",
   "permissions": [
     "downloads",
     "cookies",

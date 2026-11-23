@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller & Build artifacts
+build/
+dist/
+*.manifest
+
+# Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# User Data & Runtime Download State (Prevents personal info leaks)
+download_history.json
+download_history.json.tmp
+*.dmeta
+*.part*
+
+# Legacy archive folder (Large binary files exceeding 130MB, should be distributed via GitHub Releases)
+releases/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -125,7 +125,7 @@ def run_cli(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="⚡ FlashGet (快车) 极速多线程网络下载器 (GUI / CLI)")
+    parser = argparse.ArgumentParser(description="⚡ FlashGet 极速多线程网络下载器 (GUI / CLI)")
     parser.add_argument("url", nargs="?", help="下载链接 (URL)。若不提供且未加 --cli 则打开图形界面")
     parser.add_argument("-n", "--threads", type=int, default=8, help="并发线程数 (默认: 8)")
     parser.add_argument("-o", "--output", help="文件保存目录 (默认: 当前目录或下载目录)")

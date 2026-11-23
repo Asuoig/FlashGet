@@ -45,6 +45,43 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def repair_mojibake_filename(name: str) -> str:
+    """
+    智能纠正由 HTTP Header 编码 (ISO-8859-1) 或 URL 编码导致的 Mojibake 文件名乱码。
+    如 'å¤§å\xad¦...' -> '大学生...'
+    """
+    if not name:
+        return ""
+    # 1. 尝试 URL 解码
+    if "%" in name:
+        try:
+            unquoted = urllib.parse.unquote(name)
+            if unquoted != name:
+                name = unquoted
+        except Exception:
+            pass
+
+    # 2. 尝试将 Latin-1 (ISO-8859-1) 还原为 UTF-8
+    try:
+        raw = name.encode("latin1")
+        decoded = raw.decode("utf-8")
+        if decoded != name and any('\u4e00' <= ch <= '\u9fff' for ch in decoded):
+            return decoded
+    except Exception:
+        pass
+
+    # 3. 尝试将 Latin-1 还原为 GB18030 / GBK
+    try:
+        raw = name.encode("latin1")
+        decoded = raw.decode("gb18030")
+        if decoded != name and any('\u4e00' <= ch <= '\u9fff' for ch in decoded):
+            return decoded
+    except Exception:
+        pass
+
+    return name
+
+
 class ChunkTask:
     """Represents a single range chunk downloaded by a worker thread."""
     def __init__(self, chunk_id: int, start: int, end: int, downloaded: int = 0):
@@ -238,6 +275,12 @@ class DownloadEngine:
         """
         Probe remote URL headers to get filename, content-length, range support, and cookies.
         """
+        # 安全检查：仅允许 HTTP 与 HTTPS 协议，坚决拦截 file:// 等本地文件协议
+        parsed_url = urllib.parse.urlparse(self.url)
+        if parsed_url.scheme.lower() not in ("http", "https"):
+            self.set_status("error", f"安全拦截: 不支持的协议 [{parsed_url.scheme}]，仅允许 HTTP / HTTPS 下载。")
+            return False
+
         self.set_status("preparing", "正在检测下载链接并初始化环境...")
         try:
             req = self._get_request(range_header="bytes=0-0")
@@ -274,12 +317,16 @@ class DownloadEngine:
 
             self.filename = self._sanitize_filename(self.filename)
             self.final_file_path = os.path.join(self.save_dir, self.filename)
+            # 安全检查：确保最终路径在保存目录内，防止路径穿越
+            if not os.path.abspath(self.final_file_path).startswith(os.path.abspath(self.save_dir)):
+                self.set_status("error", "文件名异常，存在路径穿越风险！")
+                return False
             self.meta_file_path = self.final_file_path + ".dmeta"
 
-            # If total_size not obtained, try a standard HEAD request
+            # If total_size not obtained, try a standard HEAD request (with full cookies & referer)
             if self.total_size <= 0:
-                head_req = urllib.request.Request(self.url, method="HEAD")
-                head_req.add_header("User-Agent", self.DEFAULT_USER_AGENT)
+                head_req = self._get_request()
+                head_req.method = "HEAD"
                 with self._open_url(head_req, timeout=10) as head_res:
                     h_headers = head_res.headers
                     cl = h_headers.get("Content-Length")
@@ -317,30 +364,74 @@ class DownloadEngine:
 
     def _extract_filename(self, headers, url: str) -> str:
         cd = headers.get("Content-Disposition", "")
-        if cd and "filename=" in cd:
+        extracted_fn = ""
+        if cd:
             import re
-            match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^";\n]+)["\']?', cd, re.IGNORECASE)
-            if match:
-                fn = match.group(1).strip()
-                fn = urllib.parse.unquote(fn)
-                # 防止路径穿越：只取文件名部分
-                return os.path.basename(fn)
+            # 1. 优先提取符合 RFC 5987 / RFC 6266 标准的 filename*=
+            match_star = re.search(r"filename\*\s*=\s*['\"]?(?:UTF-8|utf-8)''([^';\r\n]+)['\"]?", cd, re.IGNORECASE)
+            if match_star:
+                val = match_star.group(1).strip()
+                extracted_fn = urllib.parse.unquote(val)
+            else:
+                # 2. 提取常规 filename="xxx" 或 filename=xxx，并自动修复 HTTP 标头 Mojibake 乱码
+                match_fn = re.search(r'filename\s*=\s*(?:"([^"]+)"|\'([^\']+)\'|([^;\r\n]+))', cd, re.IGNORECASE)
+                if match_fn:
+                    val = (match_fn.group(1) or match_fn.group(2) or match_fn.group(3) or "").strip()
+                    extracted_fn = repair_mojibake_filename(val)
 
-        parsed = urllib.parse.urlparse(url)
-        path = urllib.parse.unquote(parsed.path)
-        base = os.path.basename(path.rstrip('/'))
-        if base and "." in base:
-            return base
+        # 3. 如果从 Content-Disposition 没有提取到有意义的文件名，检查 URL 查询参数中的 filename/file_name/fn
+        if not extracted_fn or extracted_fn.lower() in ("download", "response_data", "file", "downloaded_file.bin"):
+            try:
+                parsed = urllib.parse.urlparse(url)
+                qs = urllib.parse.parse_qs(parsed.query)
+                for key in ("filename", "file_name", "fn", "name"):
+                    if key in qs and qs[key]:
+                        q_fn = qs[key][0].strip()
+                        q_fn = repair_mojibake_filename(q_fn)
+                        if q_fn and ("." in q_fn or len(q_fn) > 3):
+                            extracted_fn = q_fn
+                            break
+            except Exception:
+                pass
+
+        # 4. 如果仍然未获取，从 URL path 路径提取
+        if not extracted_fn:
+            parsed = urllib.parse.urlparse(url)
+            path = urllib.parse.unquote(parsed.path)
+            base = os.path.basename(path.rstrip('/'))
+            if base and "." in base:
+                extracted_fn = repair_mojibake_filename(base)
+
+        if extracted_fn:
+            return os.path.basename(extracted_fn)
         return "downloaded_file.bin"
 
+    WINDOWS_RESERVED_NAMES = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    }
+
     def _sanitize_filename(self, filename: str) -> str:
-        # 防止路径穿越：先强制取 basename
+        # 防止路径穿越：强制截取纯文件名
         filename = os.path.basename(filename)
-        invalid_chars = '<>:"/\\|?*\0'
-        for ch in invalid_chars:
-            filename = filename.replace(ch, "_")
-        filename = filename.strip(". ")
-        return filename if filename else "downloaded_file.bin"
+        # 过滤不可见控制字符 (ASCII 0~31) 及 Windows 文件系统保留字符
+        invalid_chars = set('<>:"/\\|?*\0')
+        clean_chars = []
+        for ch in filename:
+            if ord(ch) < 32 or ch in invalid_chars:
+                clean_chars.append("_")
+            else:
+                clean_chars.append(ch)
+        filename = "".join(clean_chars).strip(". ")
+        if not filename:
+            filename = "downloaded_file.bin"
+
+        # 处理 Windows 设备保留名冲突 (如 CON.txt, PRN.zip 等)
+        stem, ext = os.path.splitext(filename)
+        if stem.upper() in self.WINDOWS_RESERVED_NAMES:
+            filename = f"_{filename}"
+        return filename
 
     def _init_or_load_chunks(self, force_single: bool = False):
         """Initializes chunk splits or loads previous progress."""
@@ -512,6 +603,10 @@ class DownloadEngine:
                 self._update_progress_metrics(force_100=True)
             else:
                 self.set_status("error", f"保存失败: {self.error_message}")
+        else:
+            failed_chunks = [c for c in self.chunks if c.status == "failed"]
+            err = failed_chunks[0].error_msg if failed_chunks else "单线程下载中断"
+            self.set_status("error", f"下载未完成: {err}")
 
     def _download_chunk(self, chunk: ChunkTask):
         """Worker function for downloading a single chunk."""
@@ -549,6 +644,20 @@ class DownloadEngine:
 
                 with open(part_file, mode) as f:
                     with self._open_url(req, timeout=20) as response:
+                        code = response.getcode()
+                        # 核心修复：检测 Range 标头是否被服务器忽略 (返回 200 导致数据错乱追加)
+                        if range_header is not None and code == 200:
+                            if chunk.chunk_id > 0:
+                                self._fallback_to_single_thread = True
+                                chunk.status = "failed"
+                                chunk.error_msg = "服务端不支持 Range 分块下载"
+                                return
+                            else:
+                                f.seek(0)
+                                f.truncate(0)
+                                chunk.downloaded = 0
+                                self.supports_range = False
+
                         while True:
                             if self._pause_event.is_set() or self._cancel_event.is_set() or self._fallback_to_single_thread:
                                 chunk.status = "paused"

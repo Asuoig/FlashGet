@@ -4,10 +4,13 @@ Persists download history and task states to a local JSON file.
 """
 
 import os
+import sys
 import json
 import time
 import uuid
 from typing import List, Dict, Any, Optional
+
+from engine import repair_mojibake_filename
 
 
 class DownloadTask:
@@ -69,10 +72,13 @@ class DownloadTask:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'DownloadTask':
+        raw_fn = data.get("filename", "")
+        clean_fn = repair_mojibake_filename(raw_fn) if raw_fn else ""
+
         task = cls(
             url=data.get("url", ""),
             save_dir=data.get("save_dir", ""),
-            filename=data.get("filename", ""),
+            filename=clean_fn,
             total_size=data.get("total_size", 0),
             threads=data.get("threads", 8),
             custom_cookies=data.get("custom_cookies", ""),
@@ -83,9 +89,20 @@ class DownloadTask:
         task.downloaded_bytes = data.get("downloaded_bytes", 0)
         task.status = data.get("status", "paused")
         task.error_msg = data.get("error_msg", "")
-        task.file_path = data.get("file_path", "")
-        if not task.file_path and task.filename:
-            task.file_path = os.path.join(task.save_dir, task.filename)
+
+        raw_fp = data.get("file_path", "")
+        if raw_fp:
+            # 同步修复路径中的乱码文件名
+            task.file_path = os.path.join(task.save_dir, task.filename) if task.filename else repair_mojibake_filename(raw_fp)
+        else:
+            task.file_path = os.path.join(task.save_dir, task.filename) if task.filename else ""
+
+        # 如果磁盘上存在旧乱码文件，自动更名为正确的中文字符
+        if raw_fp and os.path.exists(raw_fp) and task.file_path != raw_fp and not os.path.exists(task.file_path):
+            try:
+                os.rename(raw_fp, task.file_path)
+            except Exception:
+                pass
 
         # Check if file actually exists and is complete
         if task.status == "completed" and not os.path.exists(task.file_path):
@@ -99,7 +116,12 @@ class HistoryManager:
     def __init__(self, storage_dir: Optional[str] = None):
         if not storage_dir:
             # 1. Prefer application directory if writable (Portable Mode)
-            app_dir = os.path.dirname(os.path.abspath(__file__))
+            # In PyInstaller frozen/onefile mode, use sys.executable directory instead of the temp _MEIPASS dir
+            if getattr(sys, "frozen", False):
+                app_dir = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+
             try:
                 test_f = os.path.join(app_dir, ".test_write")
                 with open(test_f, "w") as f:
@@ -109,24 +131,30 @@ class HistoryManager:
             except Exception:
                 # 2. Fallback to %APPDATA% or %LOCALAPPDATA%
                 appdata = os.getenv("APPDATA") or os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
-                storage_dir = os.path.join(appdata, "multithread_downloader")
+                storage_dir = os.path.join(appdata, "FlashGet")
 
         try:
             os.makedirs(storage_dir, exist_ok=True)
         except Exception:
-            storage_dir = os.path.dirname(os.path.abspath(__file__))
+            if getattr(sys, "frozen", False):
+                storage_dir = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                storage_dir = os.path.dirname(os.path.abspath(__file__))
 
         self.file_path = os.path.join(storage_dir, "download_history.json")
         self.tasks: List[DownloadTask] = []
         self.settings: Dict[str, Any] = {
             "theme": "dark",
+            "ui_scale": 100,
             "default_threads": 8,
-            "default_save_dir": os.path.join(os.path.expanduser("~"), "Downloads")
+            "default_save_dir": os.path.join(os.path.expanduser("~"), "Downloads"),
+            "close_action": "ask"  # ask, tray, exit
         }
         self.load()
 
     def load(self):
         self.tasks = []
+        needs_save = False
         if os.path.exists(self.file_path):
             try:
                 with open(self.file_path, "r", encoding="utf-8") as f:
@@ -138,18 +166,28 @@ class HistoryManager:
                     task_items = data
 
                 for item in task_items:
-                    self.tasks.append(DownloadTask.from_dict(item))
+                    orig_fn = item.get("filename", "")
+                    t = DownloadTask.from_dict(item)
+                    if orig_fn and t.filename != orig_fn:
+                        needs_save = True
+                    self.tasks.append(t)
             except Exception:
                 self.tasks = []
 
+        if needs_save:
+            self.save()
+
     def save(self):
+        """原子化持久化保存：先写入临时文件再通过原子替换覆盖，防止异常断电或强杀导致 JSON 数据损坏清空"""
         try:
             data = {
                 "settings": self.settings,
                 "tasks": [t.to_dict() for t in self.tasks]
             }
-            with open(self.file_path, "w", encoding="utf-8") as f:
+            tmp_path = self.file_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.file_path)
         except Exception:
             pass
 
@@ -161,11 +199,27 @@ class HistoryManager:
     def remove_task(self, task_id: str, delete_file: bool = False):
         task = self.get_task(task_id)
         if task:
-            if delete_file and task.file_path and os.path.exists(task.file_path):
-                try:
-                    os.remove(task.file_path)
-                except Exception:
-                    pass
+            if delete_file and task.file_path:
+                # 1. 删除最终已完成文件
+                if os.path.exists(task.file_path):
+                    try:
+                        os.remove(task.file_path)
+                    except Exception:
+                        pass
+                # 2. 清理未完成任务可能遗留的 .dmeta 和 .part* 孤儿临时文件
+                dmeta_p = task.file_path + ".dmeta"
+                if os.path.exists(dmeta_p):
+                    try:
+                        os.remove(dmeta_p)
+                    except Exception:
+                        pass
+                for i in range(36):
+                    part_p = f"{task.file_path}.part{i}"
+                    if os.path.exists(part_p):
+                        try:
+                            os.remove(part_p)
+                        except Exception:
+                            pass
             self.tasks = [t for t in self.tasks if t.id != task_id]
             self.save()
 

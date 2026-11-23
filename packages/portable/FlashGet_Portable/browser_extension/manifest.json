@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "FlashGet 极速下载接管扩展",
+  "version": "1.0.0",
+  "description": "自动拦截 Chrome / Edge 浏览器下载，无缝移交至 FlashGet 极速下载器进行多线程并发加速",
+  "permissions": [
+    "downloads",
+    "cookies",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "FlashGet 下载接管状态",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,6 @@
+# FlashGet Runtime Dependencies
+pystray>=0.19.5
+pillow>=10.0.0
+
+# Build Dependencies (Optional, for packaging executable)
+pyinstaller>=6.0.0
