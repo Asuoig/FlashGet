@@ -21,6 +21,51 @@ import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional, Dict, List
 
+AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_APP_NAME = "FlashGet"
+
+
+def is_autostart_enabled() -> bool:
+    """Check whether FlashGet is registered in Windows startup (HKCU Run)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, AUTOSTART_APP_NAME)
+            return bool(val)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def set_autostart(enabled: bool) -> tuple:
+    """Enable or disable Windows startup for FlashGet via HKCU Run registry key."""
+    if sys.platform != "win32":
+        return False, "仅支持 Windows 系统"
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                if getattr(sys, "frozen", False):
+                    cmd = f'"{sys.executable}"'
+                else:
+                    py_dir = os.path.dirname(sys.executable)
+                    pythonw = os.path.join(py_dir, "pythonw.exe")
+                    py_exe = pythonw if os.path.exists(pythonw) else sys.executable
+                    main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+                    cmd = f'"{py_exe}" "{main_py}"'
+                winreg.SetValueEx(key, AUTOSTART_APP_NAME, 0, winreg.REG_SZ, cmd)
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_APP_NAME)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
 # 1. Enable Hardware Native DPI Awareness for Razor-Sharp Text Rendering on High-DPI screens
 if sys.platform == "win32":
     try:
@@ -32,14 +77,27 @@ if sys.platform == "win32":
         except Exception:
             pass
 
-from engine import DownloadEngine, format_bytes, format_time
+from engine import (
+    DownloadEngine,
+    format_bytes,
+    format_time,
+    GLOBAL_RATE_LIMITER,
+    GLOBAL_PROXY_CONFIG,
+    compute_file_hashes,
+    normalize_proxy_url,
+)
 from history_manager import HistoryManager, DownloadTask
 import extension_bundle
 
 try:
+    from PIL import Image, ImageDraw, ImageTk
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
+try:
     import pystray
-    from PIL import Image, ImageDraw
-    HAS_PYSTRAY = True
+    HAS_PYSTRAY = HAS_PIL
 except Exception:
     HAS_PYSTRAY = False
 
@@ -194,22 +252,28 @@ THEMES = {
     "dark": {
         "is_dark": True,
         "name": "dark",
-        "bg": "#1E1E1E",
-        "fg": "#EDEDED",
-        "menu_bg": "#1F1F1F",
-        "menu_fg": "#D4D4D4",
+        "bg": "#18181B",
+        "fg": "#F1F5F9",
+        "menu_bg": "#141417",
+        "menu_fg": "#E2E8F0",
         "menu_active_bg": "#0F4C81",
-        "toolbar_bg": "#2C2C2C",
-        "btn_bg": "#2C2C2C",
-        "btn_hover": "#3E3E3E",
-        "btn_text": "#EDEDED",
-        "table_bg": "#1E1E1E",
-        "table_fg": "#EDEDED",
-        "table_row2": "#282828",
-        "table_header_bg": "#2E2E2E",
-        "table_header_fg": "#FFFFFF",
-        "table_header_active": "#3E3E3E",
-        "border": "#484848",
+        "toolbar_bg": "#202024",
+        "btn_bg": "#202024",
+        "btn_hover": "#2E2E35",
+        "btn_text": "#F1F5F9",
+        "table_bg": "#1B1B1F",
+        "table_fg": "#E2E8F0",
+        "table_row2": "#222227",
+        "table_header_bg": "#27272D",
+        "table_header_fg": "#F8FAFC",
+        "table_header_active": "#32323A",
+        "card_bg": "#232328",
+        "input_bg": "#141417",
+        "readonly_bg": "#1D1D21",
+        "border": "#34343D",
+        "input_border": "#484854",
+        "hint_fg": "#94A3B8",
+        "accent_fg": "#38BDF8",
         "select_bg": "#0F4C81",
         "select_fg": "#FFFFFF",
         "theme_toggle_btn": "☀️ 浅色模式"
@@ -217,22 +281,28 @@ THEMES = {
     "light": {
         "is_dark": False,
         "name": "light",
-        "bg": "#F0F2F5",
-        "fg": "#1E293B",
+        "bg": "#F1F5F9",
+        "fg": "#0F172A",
         "menu_bg": "#FFFFFF",
         "menu_fg": "#1E293B",
         "menu_active_bg": "#2563EB",
         "toolbar_bg": "#F8FAFC",
         "btn_bg": "#F8FAFC",
         "btn_hover": "#E2E8F0",
-        "btn_text": "#1E293B",
+        "btn_text": "#0F172A",
         "table_bg": "#FFFFFF",
-        "table_fg": "#1E293B",
-        "table_row2": "#F1F5F9",
-        "table_header_bg": "#E2E8F0",
-        "table_header_fg": "#0F172A",
-        "table_header_active": "#CBD5E1",
-        "border": "#94A3B8",
+        "table_fg": "#0F172A",
+        "table_row2": "#F8FAFC",
+        "table_header_bg": "#EEF2F6",
+        "table_header_fg": "#1E293B",
+        "table_header_active": "#E2E8F0",
+        "card_bg": "#FFFFFF",
+        "input_bg": "#FFFFFF",
+        "readonly_bg": "#F1F5F9",
+        "border": "#CBD5E1",
+        "input_border": "#94A3B8",
+        "hint_fg": "#64748B",
+        "accent_fg": "#2563EB",
         "select_bg": "#2563EB",
         "select_fg": "#FFFFFF",
         "theme_toggle_btn": "🌙 暗黑模式"
@@ -332,6 +402,9 @@ class FlashGetApp(tk.Tk):
         self._set_app_window_icon()
 
         self.history_mgr = HistoryManager()
+        if self.history_mgr.settings.get("auto_start", True) and not is_autostart_enabled():
+            set_autostart(True)
+        self._sync_engine_runtime_settings()
         self.active_engines: Dict[str, DownloadEngine] = {}
         self.detail_windows: Dict[str, tk.Toplevel] = {}
 
@@ -422,8 +495,10 @@ class FlashGetApp(tk.Tk):
                 lbl.configure(
                     font=("Microsoft YaHei UI", self.s(9)),
                     padx=self.s(6),
-                    pady=self.s(2)
+                    pady=self.s(3)
                 )
+        if hasattr(self, 'menu_border'):
+            self.menu_border.configure(height=max(1, self.s(1)))
         if hasattr(self, 'ctx_menu'):
             self.ctx_menu.configure(font=("Microsoft YaHei UI", self.s(9)))
 
@@ -452,6 +527,8 @@ class FlashGetApp(tk.Tk):
             )
         if hasattr(self, 'tree'):
             self.auto_fit_columns()
+        if hasattr(self, 'ctx_menu'):
+            self.apply_current_theme()
 
     def auto_fit_columns(self):
         """像 Excel 那样，根据表头和当前行内容自动计算最佳展示列宽"""
@@ -564,7 +641,19 @@ class FlashGetApp(tk.Tk):
                     self.end_headers()
 
             def do_POST(self):
-                if self.path == "/download":
+                if self.path == "/focus":
+                    if not self._is_allowed_origin():
+                        self.send_response(403)
+                        self.end_headers()
+                        self.wfile.write(b'{"error":"forbidden: invalid origin"}')
+                        return
+                    app_ref.restore_from_tray()
+                    self.send_response(200)
+                    self._send_cors_headers()
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"focused"}')
+                elif self.path == "/download":
                     # CSRF 防护：拒绝来自非扩展网页的请求
                     if not self._is_allowed_origin():
                         self.send_response(403)
@@ -655,6 +744,8 @@ class FlashGetApp(tk.Tk):
 
         # Menu Bar
         self.menu_frame.configure(bg=t["menu_bg"])
+        if hasattr(self, 'menu_border'):
+            self.menu_border.configure(bg=t["border"])
         for lbl in self.menu_labels:
             lbl.configure(bg=t["menu_bg"], fg=t["menu_fg"])
 
@@ -669,12 +760,17 @@ class FlashGetApp(tk.Tk):
         # Table & Headings (突出现代视觉风格：平整贴合表头，消除立体小方块突兀感，自动充满视口)
         if hasattr(self, 'table_container'):
             self.table_container.configure(bg=t["border"], highlightbackground=t["border"])
+        if hasattr(self, 'list_frame'):
+            self.list_frame.configure(bg=t["table_bg"])
 
         self.style.configure(
             "Treeview",
             background=t["table_bg"],
             foreground=t["table_fg"],
             fieldbackground=t["table_bg"],
+            bordercolor=t["table_bg"],
+            lightcolor=t["table_bg"],
+            darkcolor=t["table_bg"],
             font=("Microsoft YaHei UI", self.s(9)),
             rowheight=self.s(28),
             borderwidth=0,
@@ -693,6 +789,8 @@ class FlashGetApp(tk.Tk):
             relief="flat",
             borderwidth=1,
             bordercolor=t["border"],
+            lightcolor=t["table_header_bg"],
+            darkcolor=t["border"],
             padding=(self.s(4), self.s(6))
         )
         self.style.map("Treeview.Heading", background=[("active", t["table_header_active"])])
@@ -701,17 +799,20 @@ class FlashGetApp(tk.Tk):
             self.tree.tag_configure("evenrow", background=t["table_bg"], foreground=t["table_fg"])
             self.tree.tag_configure("oddrow", background=t["table_row2"], foreground=t["table_fg"])
 
-        # 滚动条全量暗黑风格定制（滑道深黑、滑块暗灰、单线纯平、绝无亮白条）
-        scrollbar_bg = "#38383A" if t["is_dark"] else "#C0C0C0"
-        scrollbar_hover = "#4E4E52" if t["is_dark"] else "#A0A0A0"
-        trough_bg = "#141416" if t["is_dark"] else "#F0F0F0"
+        # 滚动条双模精细定制（深色纯平沉稳、浅色清爽高对比）
+        is_dark = t["is_dark"]
+        scrollbar_bg = "#3E3E46" if is_dark else "#CBD5E1"
+        scrollbar_hover = "#52525C" if is_dark else "#94A3B8"
+        trough_bg = "#141417" if is_dark else "#F1F5F9"
+        arrow_fg = "#94A3B8" if is_dark else "#475569"
+        arrow_active = "#FFFFFF" if is_dark else "#0F172A"
 
         self.style.configure(
             "TScrollbar",
             background=scrollbar_bg,
             troughcolor=trough_bg,
             bordercolor=trough_bg,
-            arrowcolor=scrollbar_bg,
+            arrowcolor=arrow_fg,
             lightcolor=scrollbar_bg,
             darkcolor=scrollbar_bg,
             arrowsize=self.s(11),
@@ -722,23 +823,62 @@ class FlashGetApp(tk.Tk):
             "TScrollbar",
             background=[("active", scrollbar_hover), ("pressed", t["select_bg"])],
             troughcolor=[("active", trough_bg)],
-            arrowcolor=[("active", "#FFFFFF")]
+            arrowcolor=[("active", arrow_active)]
         )
 
-        # 对话框专用深色组件定制（消除所有突兀亮白底色）
+        # 进度条双模定制（主进度条与多线程分块网格进度条）
+        pbar_fill = t["accent_fg"]
+        self.style.configure(
+            "Horizontal.TProgressbar",
+            troughcolor=t["input_bg"],
+            background=pbar_fill,
+            bordercolor=t["border"],
+            lightcolor=pbar_fill,
+            darkcolor=pbar_fill,
+            pbarrelief="flat",
+            relief="flat",
+            borderwidth=1
+        )
+
+        # 对话框专用组件全套主题定制（深浅双模统一，该黑则深邃纯粹，该白则通透干净）
+        card_bg = t["card_bg"]
+        input_bg = t["input_bg"]
+        readonly_bg = t["readonly_bg"]
+        input_border = t["input_border"]
+        btn_bg = "#2C2C32" if is_dark else "#E2E8F0"
+        btn_hover = "#3D3D45" if is_dark else "#CBD5E1"
+        accent_bg = t["select_bg"]
+        accent_hover = "#1D6FB8" if is_dark else "#1D4ED8"
+        focus_col = t["accent_fg"]
+        ind_bg = t["input_bg"]
+
+        # 计算与正文完全匹配的复选框/单选框物理像素尺寸 (自适应高分屏 DPI)
+        try:
+            fnt_ref = tkfont.Font(family="Microsoft YaHei UI", size=self.s(9), root=self)
+            ind_size = max(16, int(fnt_ref.metrics("ascent") * 0.96))
+        except Exception:
+            ind_size = max(16, self.s(18))
+
         self.style.configure(
             "Dialog.TRadiobutton",
-            background=t["table_row2"] if t["is_dark"] else "#F3F4F6",
+            background=card_bg,
             foreground=t["fg"],
             font=("Microsoft YaHei UI", self.s(9)),
-            indicatorcolor="#18181A" if t["is_dark"] else "#FFFFFF",
-            indicatorrelief="flat"
+            indicatorsize=ind_size,
+            indicatormargin=(0, 0, self.s(8), 0),
+            indicatorbackground=ind_bg,
+            indicatorforeground="#FFFFFF",
+            upperbordercolor=input_border,
+            lowerbordercolor=input_border,
+            padding=(self.s(2), self.s(3))
         )
         self.style.map(
             "Dialog.TRadiobutton",
-            background=[("active", t["table_row2"] if t["is_dark"] else "#F3F4F6")],
-            foreground=[("active", "#FFFFFF" if t["is_dark"] else "#000000")],
-            indicatorcolor=[("selected", "#38BDF8"), ("pressed", "#0284C7")]
+            background=[("active", card_bg)],
+            foreground=[("active", "#FFFFFF" if is_dark else "#0F172A")],
+            indicatorbackground=[("selected", "#0284C7" if is_dark else "#2563EB"), ("active", btn_bg)],
+            upperbordercolor=[("selected", focus_col), ("active", focus_col)],
+            lowerbordercolor=[("selected", focus_col), ("active", focus_col)]
         )
 
         self.style.configure(
@@ -746,39 +886,278 @@ class FlashGetApp(tk.Tk):
             background=t["bg"],
             foreground=t["fg"],
             font=("Microsoft YaHei UI", self.s(9)),
-            indicatorcolor="#242428" if t["is_dark"] else "#FFFFFF",
-            indicatorrelief="flat"
+            indicatorsize=ind_size,
+            indicatormargin=(0, 0, self.s(8), 0),
+            indicatorbackground=ind_bg,
+            indicatorforeground="#FFFFFF",
+            upperbordercolor=t["border"],
+            lowerbordercolor=t["border"],
+            padding=(self.s(2), self.s(3))
         )
         self.style.map(
             "Dialog.TCheckbutton",
             background=[("active", t["bg"])],
-            foreground=[("active", "#FFFFFF" if t["is_dark"] else "#000000")],
-            indicatorcolor=[("selected", "#38BDF8"), ("pressed", "#0284C7")]
+            foreground=[("active", "#FFFFFF" if is_dark else "#000000")],
+            indicatorbackground=[("selected", "#0284C7" if is_dark else "#2563EB"), ("active", btn_bg)],
+            upperbordercolor=[("selected", focus_col), ("active", focus_col)],
+            lowerbordercolor=[("selected", focus_col), ("active", focus_col)]
         )
 
         self.style.configure(
+            "Card.TCheckbutton",
+            background=card_bg,
+            foreground=t["fg"],
+            font=("Microsoft YaHei UI", self.s(9)),
+            indicatorsize=ind_size,
+            indicatormargin=(0, 0, self.s(8), 0),
+            indicatorbackground=ind_bg,
+            indicatorforeground="#FFFFFF",
+            upperbordercolor=t["border"],
+            lowerbordercolor=t["border"],
+            padding=(self.s(2), self.s(3))
+        )
+        self.style.map(
+            "Card.TCheckbutton",
+            background=[("active", card_bg)],
+            foreground=[("active", "#FFFFFF" if is_dark else "#000000")],
+            indicatorbackground=[("selected", "#0284C7" if is_dark else "#2563EB"), ("active", btn_bg)],
+            upperbordercolor=[("selected", focus_col), ("active", focus_col)],
+            lowerbordercolor=[("selected", focus_col), ("active", focus_col)]
+        )
+
+        # 使用 PIL 4x 超采样绘制圆角矢量对勾与单选点，彻底告别 clam 自带的锯齿小叉叉
+        if HAS_PIL:
+            try:
+                if not hasattr(self, "_theme_images"):
+                    self._theme_images = []
+                if not hasattr(self, "_ind_elem_idx"):
+                    self._ind_elem_idx = 0
+                self._ind_elem_idx += 1
+                eid = self._ind_elem_idx
+
+                gap = max(6, int(ind_size * 0.45))
+                w_tot = ind_size + gap
+                h_tot = ind_size
+                ss = 4
+                W, H, S = w_tot * ss, h_tot * ss, ind_size * ss
+                pad = max(2, int(1.2 * ss))
+                rad = max(4, int(S * 0.22))
+                chk_fill = "#0284C7" if is_dark else "#2563EB"
+                chk_outline = "#38BDF8" if is_dark else "#1D4ED8"
+                unchk_outline = "#64748B" if is_dark else "#94A3B8"
+
+                def draw_cb(checked: bool, hovered: bool):
+                    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                    dc = ImageDraw.Draw(img)
+                    if checked:
+                        dc.rounded_rectangle(
+                            [pad, pad, S - pad, S - pad],
+                            radius=rad,
+                            fill=chk_fill,
+                            outline=chk_outline,
+                            width=max(2, int(1.4 * ss))
+                        )
+                        dc.line(
+                            [
+                                (int(S * 0.25), int(S * 0.52)),
+                                (int(S * 0.43), int(S * 0.70)),
+                                (int(S * 0.76), int(S * 0.30)),
+                            ],
+                            fill="#FFFFFF",
+                            width=max(3, int(2.1 * ss)),
+                            joint="curve"
+                        )
+                    else:
+                        dc.rounded_rectangle(
+                            [pad, pad, S - pad, S - pad],
+                            radius=rad,
+                            fill=input_bg,
+                            outline=focus_col if hovered else unchk_outline,
+                            width=max(2, int(1.5 * ss))
+                        )
+                    return ImageTk.PhotoImage(img.resize((w_tot, h_tot), Image.LANCZOS), master=self)
+
+                def draw_rb(selected: bool, hovered: bool):
+                    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                    dc = ImageDraw.Draw(img)
+                    if selected:
+                        dc.ellipse(
+                            [pad, pad, S - pad, S - pad],
+                            fill=chk_fill,
+                            outline=chk_outline,
+                            width=max(2, int(1.4 * ss))
+                        )
+                        r_in = int(S * 0.26)
+                        cx = cy = S // 2
+                        dc.ellipse([cx - r_in, cy - r_in, cx + r_in, cy + r_in], fill="#FFFFFF")
+                    else:
+                        dc.ellipse(
+                            [pad, pad, S - pad, S - pad],
+                            fill=input_bg,
+                            outline=focus_col if hovered else unchk_outline,
+                            width=max(2, int(1.5 * ss))
+                        )
+                    return ImageTk.PhotoImage(img.resize((w_tot, h_tot), Image.LANCZOS), master=self)
+
+                cb_u = draw_cb(False, False)
+                cb_uh = draw_cb(False, True)
+                cb_c = draw_cb(True, False)
+                rb_u = draw_rb(False, False)
+                rb_uh = draw_rb(False, True)
+                rb_s = draw_rb(True, False)
+                self._theme_images.extend([cb_u, cb_uh, cb_c, rb_u, rb_uh, rb_s])
+
+                cb_elem = f"FG.Check{eid}.indicator"
+                rb_elem = f"FG.Radio{eid}.indicator"
+                self.style.element_create(cb_elem, "image", cb_u, ("selected", cb_c), ("active", cb_uh), sticky="w")
+                self.style.element_create(rb_elem, "image", rb_u, ("selected", rb_s), ("active", rb_uh), sticky="w")
+
+                cb_layout = [
+                    ("Checkbutton.padding", {"sticky": "nswe", "children": [
+                        (cb_elem, {"side": "left", "sticky": ""}),
+                        ("Checkbutton.focus", {"side": "left", "sticky": "w", "children": [
+                            ("Checkbutton.label", {"sticky": "nswe"})
+                        ]})
+                    ]})
+                ]
+                rb_layout = [
+                    ("Radiobutton.padding", {"sticky": "nswe", "children": [
+                        (rb_elem, {"side": "left", "sticky": ""}),
+                        ("Radiobutton.focus", {"side": "left", "sticky": "w", "children": [
+                            ("Radiobutton.label", {"sticky": "nswe"})
+                        ]})
+                    ]})
+                ]
+                self.style.layout("Dialog.TCheckbutton", cb_layout)
+                self.style.layout("Card.TCheckbutton", cb_layout)
+                self.style.layout("Dialog.TRadiobutton", rb_layout)
+            except Exception:
+                pass
+
+        self.style.configure(
             "Dialog.TButton",
-            background="#2C2C2E" if t["is_dark"] else "#E5E7EB",
+            background=btn_bg,
             foreground=t["fg"],
             bordercolor=t["border"],
-            lightcolor="#2C2C2E" if t["is_dark"] else "#E5E7EB",
-            darkcolor="#2C2C2E" if t["is_dark"] else "#E5E7EB",
+            lightcolor=btn_bg,
+            darkcolor=btn_bg,
             font=("Microsoft YaHei UI", self.s(9)),
             relief="flat",
-            padding=(self.s(10), self.s(4))
+            padding=(self.s(12), self.s(5))
         )
         self.style.map(
             "Dialog.TButton",
-            background=[("active", "#3E3E42" if t["is_dark"] else "#D1D5DB"), ("pressed", t["select_bg"])],
+            background=[("active", btn_hover), ("pressed", accent_bg)],
+            foreground=[("active", "#FFFFFF" if is_dark else "#0F172A"), ("pressed", "#FFFFFF")]
+        )
+
+        self.style.configure(
+            "Accent.TButton",
+            background=accent_bg,
+            foreground="#FFFFFF",
+            bordercolor=focus_col,
+            lightcolor=accent_bg,
+            darkcolor=accent_bg,
+            font=("Microsoft YaHei UI", self.s(9), "bold"),
+            relief="flat",
+            padding=(self.s(14), self.s(5))
+        )
+        self.style.map(
+            "Accent.TButton",
+            background=[("active", accent_hover), ("pressed", "#0B3A63" if is_dark else "#1E40AF")],
             foreground=[("active", "#FFFFFF")]
         )
+
+        self.style.configure(
+            "Dialog.TEntry",
+            fieldbackground=input_bg,
+            foreground=t["fg"],
+            insertcolor=t["fg"],
+            bordercolor=input_border,
+            lightcolor=input_bg,
+            darkcolor=input_bg,
+            selectbackground=accent_bg,
+            selectforeground="#FFFFFF",
+            padding=(self.s(6), self.s(4))
+        )
+        self.style.map(
+            "Dialog.TEntry",
+            fieldbackground=[("readonly", readonly_bg)],
+            bordercolor=[("focus", focus_col)]
+        )
+
+        self.style.configure(
+            "Dialog.TCombobox",
+            fieldbackground=input_bg,
+            background=btn_bg,
+            foreground=t["fg"],
+            arrowcolor=t["fg"],
+            bordercolor=input_border,
+            lightcolor=btn_bg,
+            darkcolor=btn_bg,
+            selectbackground=accent_bg,
+            selectforeground="#FFFFFF",
+            padding=(self.s(6), self.s(4))
+        )
+        self.style.map(
+            "Dialog.TCombobox",
+            fieldbackground=[("readonly", input_bg)],
+            foreground=[("readonly", t["fg"])],
+            background=[("active", btn_hover)],
+            bordercolor=[("focus", focus_col)]
+        )
+
+        self.style.configure(
+            "Dialog.TSpinbox",
+            fieldbackground=input_bg,
+            background=btn_bg,
+            foreground=t["fg"],
+            arrowcolor=t["fg"],
+            bordercolor=input_border,
+            lightcolor=btn_bg,
+            darkcolor=btn_bg,
+            selectbackground=accent_bg,
+            selectforeground="#FFFFFF",
+            padding=(self.s(6), self.s(4))
+        )
+        self.style.map(
+            "Dialog.TSpinbox",
+            bordercolor=[("focus", focus_col)],
+            background=[("active", btn_hover)]
+        )
+
+        # 下拉列表弹窗跟随暗黑/浅色主题
+        self.option_add("*TCombobox*Listbox.background", input_bg)
+        self.option_add("*TCombobox*Listbox.foreground", t["fg"])
+        self.option_add("*TCombobox*Listbox.selectBackground", accent_bg)
+        self.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
 
         # Context Menu
         self.ctx_menu.configure(
             bg=t["menu_bg"],
             fg=t["menu_fg"],
             activebackground=t["select_bg"],
-            activeforeground="#FFFFFF"
+            activeforeground="#FFFFFF",
+            disabledforeground=t["hint_fg"],
+            bd=0,
+            activeborderwidth=0
+        )
+
+    def _create_themed_menu(self, parent=None) -> tk.Menu:
+        """创建严格匹配当前深/浅主题的统一样式弹出菜单"""
+        t = self.theme
+        return tk.Menu(
+            parent or self,
+            tearoff=0,
+            bd=0,
+            activeborderwidth=0,
+            relief="flat",
+            bg=t["menu_bg"],
+            fg=t["menu_fg"],
+            activebackground=t["select_bg"],
+            activeforeground="#FFFFFF",
+            disabledforeground=t["hint_fg"],
+            font=("Microsoft YaHei UI", self.s(9))
         )
 
     def toggle_theme(self):
@@ -818,7 +1197,7 @@ class FlashGetApp(tk.Tk):
                 bg=self.theme["menu_bg"],
                 fg=self.theme["menu_fg"],
                 padx=self.s(6),
-                pady=self.s(2),
+                pady=self.s(3),
                 cursor="hand2"
             )
             lbl.pack(side=tk.LEFT)
@@ -827,18 +1206,21 @@ class FlashGetApp(tk.Tk):
             lbl.bind("<Leave>", lambda e, l=lbl: l.configure(bg=self.theme["menu_bg"], fg=self.theme["menu_fg"]))
             self.menu_labels.append(lbl)
 
+        self.menu_border = tk.Frame(self, bg=self.theme["border"], height=max(1, self.s(1)))
+        self.menu_border.pack(fill=tk.X, side=tk.TOP)
+
     def _show_menu_popup(self, anchor_lbl, menu):
         x = anchor_lbl.winfo_rootx()
         y = anchor_lbl.winfo_rooty() + anchor_lbl.winfo_height()
         menu.post(x, y)
 
     def _show_task_menu(self, anchor_lbl):
-        m = tk.Menu(self, tearoff=0, bg=self.theme["menu_bg"], fg=self.theme["menu_fg"], activebackground=self.theme["select_bg"], activeforeground="#FFFFFF", font=("Microsoft YaHei UI", self.s(9)))
+        m = self._create_themed_menu()
         m.add_command(label="新建任务 (N)...", accelerator="Ctrl+N", command=self.open_new_task_dialog)
         m.add_separator()
         m.add_command(label="刷新列表 (R)", accelerator="F5", command=self.refresh_table)
 
-        sub_clean = tk.Menu(m, tearoff=0, bg=self.theme["menu_bg"], fg=self.theme["menu_fg"], activebackground=self.theme["select_bg"], activeforeground="#FFFFFF", font=("Microsoft YaHei UI", self.s(9)))
+        sub_clean = self._create_themed_menu(m)
         sub_clean.add_command(label="清空全部任务历史 (A)", command=self.delete_all_tasks)
         m.add_cascade(label="历史管理", menu=sub_clean)
 
@@ -847,7 +1229,7 @@ class FlashGetApp(tk.Tk):
         self._show_menu_popup(anchor_lbl, m)
 
     def _show_file_menu(self, anchor_lbl):
-        m = tk.Menu(self, tearoff=0, bg=self.theme["menu_bg"], fg=self.theme["menu_fg"], activebackground=self.theme["select_bg"], activeforeground="#FFFFFF", font=("Microsoft YaHei UI", self.s(9)))
+        m = self._create_themed_menu()
         m.add_command(label="打开文件 (O)", accelerator="Enter", command=self.open_selected_file)
         m.add_command(label="打开所在目录 (D)", command=self.open_selected_dir)
         m.add_separator()
@@ -855,36 +1237,111 @@ class FlashGetApp(tk.Tk):
         self._show_menu_popup(anchor_lbl, m)
 
     def _show_download_menu(self, anchor_lbl):
-        m = tk.Menu(self, tearoff=0, bg=self.theme["menu_bg"], fg=self.theme["menu_fg"], activebackground=self.theme["select_bg"], activeforeground="#FFFFFF", font=("Microsoft YaHei UI", self.s(9)))
+        m = self._create_themed_menu()
         m.add_command(label="开始 / 继续 (R)", command=self.resume_selected_task)
         m.add_command(label="暂停下载 (P)", command=self.pause_selected_task)
         m.add_command(label="全部停止 (S)", command=self.stop_all_tasks)
+        m.add_separator()
+        m.add_command(label="文件完整性校验 (MD5/SHA256)...", command=self.open_selected_checksum_dialog)
         m.add_separator()
         m.add_command(label="删除选中任务 (D)", accelerator="Del", command=self.delete_selected_task)
         self._show_menu_popup(anchor_lbl, m)
 
     def _show_help_menu(self, anchor_lbl):
-        m = tk.Menu(self, tearoff=0, bg=self.theme["menu_bg"], fg=self.theme["menu_fg"], activebackground=self.theme["select_bg"], activeforeground="#FFFFFF", font=("Microsoft YaHei UI", self.s(9)))
+        m = self._create_themed_menu()
         m.add_command(label="浏览器接管扩展 (Chrome/Edge)...", command=self.open_extension_guide)
         m.add_separator()
         m.add_command(label="关于 FlashGet (A)...", command=self.show_about_dialog)
         self._show_menu_popup(anchor_lbl, m)
 
     def show_about_dialog(self):
-        """展示带有版本号与详细信息的关于对话框"""
-        about_text = (
-            f"FlashGet 极速多线程下载器\n\n"
-            f"版本号: {APP_VERSION} ({APP_BUILD})\n"
-            f"架构环境: Python 3.11 x64 (Windows 原生驱动)\n\n"
-            f"核心特性:\n"
-            f"• 智能动态分块 & 多线程并发极速下载\n"
-            f"• 完整断点续传与网络防抖自动恢复\n"
-            f"• 现代深色模式与高清 DPI 等比缩放\n"
-            f"• 系统托盘后台常驻静默运行\n"
-            f"• Chrome / Edge 浏览器扩展一键接管\n\n"
-            f"© 2026 FlashGet Team. All rights reserved."
+        """展示带有版本号与详细信息的关于对话框（严格跟随深/浅双模主题）"""
+        t = self.theme
+        card_bg = t["card_bg"]
+        hint_fg = t["hint_fg"]
+        accent_fg = t["accent_fg"]
+
+        dlg = tk.Toplevel(self)
+        apply_window_icon(dlg)
+        dlg.title("关于 FlashGet")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=t["bg"])
+        set_window_dark_titlebar(dlg, t["is_dark"])
+
+        pad_f = tk.Frame(dlg, padx=self.s(20), pady=self.s(18), bg=t["bg"])
+        pad_f.pack(fill=tk.BOTH, expand=True)
+
+        btn_bar = tk.Frame(pad_f, bg=t["bg"])
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(14), 0))
+
+        header_f = tk.Frame(pad_f, bg=t["bg"])
+        header_f.pack(fill=tk.X, pady=(0, self.s(12)))
+
+        tk.Label(
+            header_f,
+            text="⚡",
+            font=("Segoe UI Emoji", self.s(24)),
+            fg="#FACC15" if t["is_dark"] else "#EAB308",
+            bg=t["bg"]
+        ).pack(side=tk.LEFT, padx=(0, self.s(10)))
+
+        title_col = tk.Frame(header_f, bg=t["bg"])
+        title_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(
+            title_col,
+            text="FlashGet 极速多线程下载器",
+            font=("Microsoft YaHei UI", self.s(12), "bold"),
+            fg=t["fg"],
+            bg=t["bg"]
+        ).pack(anchor="w")
+        tk.Label(
+            title_col,
+            text=f"版本 {APP_VERSION} ({APP_BUILD}) · Python 3.11 x64 原生驱动",
+            font=("Microsoft YaHei UI", self.s(8)),
+            fg=accent_fg,
+            bg=t["bg"]
+        ).pack(anchor="w", pady=(self.s(2), 0))
+
+        card = tk.Frame(
+            pad_f,
+            bg=card_bg,
+            padx=self.s(14),
+            pady=self.s(12),
+            highlightthickness=1,
+            highlightbackground=t["border"]
         )
-        messagebox.showinfo("关于 FlashGet", about_text, parent=self)
+        card.pack(fill=tk.BOTH, expand=True)
+
+        features = (
+            "核心特性：\n"
+            "• 智能动态分块 & 1~32 线程并发极速下载\n"
+            "• 完整断点续传与网络防抖自动恢复\n"
+            "• 深色 / 浅色双主题与高清 DPI 自适应缩放\n"
+            "• 系统托盘后台常驻与单实例唤醒置顶\n"
+            "• Chrome / Edge 浏览器扩展一键接管下载"
+        )
+        tk.Label(
+            card,
+            text=features,
+            font=("Microsoft YaHei UI", self.s(9)),
+            fg=t["fg"],
+            bg=card_bg,
+            justify=tk.LEFT,
+            anchor="w"
+        ).pack(fill=tk.X)
+
+        tk.Label(
+            pad_f,
+            text="© 2026 FlashGet Team. All rights reserved.",
+            font=("Microsoft YaHei UI", self.s(8)),
+            fg=hint_fg,
+            bg=t["bg"]
+        ).pack(anchor="w", pady=(self.s(10), 0))
+
+        ttk.Button(btn_bar, text="确定", command=dlg.destroy, width=10, style="Accent.TButton").pack(side=tk.RIGHT)
+        setup_dialog_geometry(dlg, self, min_width=440, min_height=290, scale_func=self.s)
 
     def _set_app_window_icon(self):
         """将主窗口及所有子弹窗的标题栏左上角图标全局替换为闪电图标（彻底消除蓝色小羽毛）"""
@@ -901,31 +1358,37 @@ class FlashGetApp(tk.Tk):
             pass
 
         # 弹出专门的扩展安装引导窗口（自适应居中，绝不截断）
+        t = self.theme
+        card_bg = t["card_bg"]
         dialog = tk.Toplevel(self)
         apply_window_icon(dialog)
         dialog.title("🧩 浏览器接管扩展安装说明")
         dialog.resizable(True, True)
         dialog.transient(self)
         dialog.grab_set()
-        set_window_dark_titlebar(dialog, self.theme["is_dark"])
+        dialog.configure(bg=t["bg"])
+        set_window_dark_titlebar(dialog, t["is_dark"])
 
-        pad_f = tk.Frame(dialog, padx=self.s(16), pady=self.s(16))
+        pad_f = tk.Frame(dialog, padx=self.s(18), pady=self.s(16), bg=t["bg"])
         pad_f.pack(fill=tk.BOTH, expand=True)
 
         # 底部按钮栏
-        btn_bar = tk.Frame(pad_f)
-        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(10), 0))
+        btn_bar = tk.Frame(pad_f, bg=t["bg"])
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(12), 0))
 
-        content_f = tk.Frame(pad_f)
+        content_f = tk.Frame(pad_f, bg=t["bg"])
         content_f.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(content_f, text="浏览器接管扩展（Chrome / Edge）", font=("Microsoft YaHei UI", self.s(11), "bold")).pack(anchor="w", pady=(0, self.s(6)))
+        tk.Label(content_f, text="浏览器接管扩展（Chrome / Edge）", font=("Microsoft YaHei UI", self.s(11), "bold"), fg=t["fg"], bg=t["bg"]).pack(anchor="w", pady=(0, self.s(8)))
 
-        tk.Label(content_f, text="扩展所在本地目录（已自动为您打开）：", font=("Microsoft YaHei UI", self.s(9), "bold")).pack(anchor="w")
-        path_box = tk.Frame(content_f)
-        path_box.pack(fill=tk.X, pady=(self.s(2), self.s(10)))
+        card_f = tk.Frame(content_f, bg=card_bg, padx=self.s(14), pady=self.s(12), highlightthickness=1, highlightbackground=t["border"])
+        card_f.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(card_f, text="扩展所在本地目录（已自动为您打开）：", font=("Microsoft YaHei UI", self.s(9), "bold"), fg=t["fg"], bg=card_bg).pack(anchor="w")
+        path_box = tk.Frame(card_f, bg=card_bg)
+        path_box.pack(fill=tk.X, pady=(self.s(4), self.s(10)))
         path_v = tk.StringVar(value=ext_dir)
-        e = ttk.Entry(path_box, textvariable=path_v, font=("Consolas", self.s(9)), state="readonly")
+        e = ttk.Entry(path_box, textvariable=path_v, font=("Consolas", self.s(9)), state="readonly", style="Dialog.TEntry")
         e.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6)))
 
         def copy_path():
@@ -933,8 +1396,8 @@ class FlashGetApp(tk.Tk):
             self.clipboard_append(ext_dir)
             messagebox.showinfo("复制成功", "扩展目录路径已成功复制到剪贴板！", parent=dialog)
 
-        ttk.Button(path_box, text="📋 复制路径", command=copy_path).pack(side=tk.RIGHT, padx=(0, self.s(4)))
-        ttk.Button(path_box, text="📂 打开目录", command=lambda: os.startfile(ext_dir) if sys.platform == "win32" else None).pack(side=tk.RIGHT)
+        ttk.Button(path_box, text="📋 复制路径", command=copy_path, style="Dialog.TButton").pack(side=tk.RIGHT, padx=(0, self.s(4)))
+        ttk.Button(path_box, text="📂 打开目录", command=lambda: os.startfile(ext_dir) if sys.platform == "win32" else None, style="Dialog.TButton").pack(side=tk.RIGHT)
 
         guide_text = (
             "只需 3 步即可完成安装（耗时约 10 秒）：\n\n"
@@ -944,10 +1407,10 @@ class FlashGetApp(tk.Tk):
             "3. 点击【加载已解压的扩展程序】，选择上方路径的 browser_extension 文件夹。\n\n"
             "✔ 安装完成后，网页点击任何下载链接将自动由 FlashGet 弹窗接管并发加速！"
         )
-        tk.Label(content_f, text=guide_text, font=("Microsoft YaHei UI", self.s(9)), justify=tk.LEFT, anchor="w").pack(fill=tk.X, pady=(self.s(4), 0))
+        tk.Label(card_f, text=guide_text, font=("Microsoft YaHei UI", self.s(9)), fg=t["fg"], bg=card_bg, justify=tk.LEFT, anchor="w").pack(fill=tk.X, pady=(self.s(2), 0))
 
-        ttk.Button(btn_bar, text="我知道了", command=dialog.destroy).pack(side=tk.RIGHT)
-        setup_dialog_geometry(dialog, self, min_width=520, min_height=360, scale_func=self.s)
+        ttk.Button(btn_bar, text="我知道了", command=dialog.destroy, style="Accent.TButton").pack(side=tk.RIGHT)
+        setup_dialog_geometry(dialog, self, min_width=540, min_height=360, scale_func=self.s)
 
     # ================= 2. 100% Real Functional Toolbar (已剔除虚假未实装按钮) =================
     def _build_flashget_toolbar(self):
@@ -994,15 +1457,15 @@ class FlashGetApp(tk.Tk):
         )
         self.table_container.pack(fill=tk.BOTH, expand=True, padx=self.s(3), pady=self.s(3))
 
-        list_frame = tk.Frame(self.table_container, bg=self.theme["bg"], bd=0)
-        list_frame.pack(fill=tk.BOTH, expand=True)
+        self.list_frame = tk.Frame(self.table_container, bg=self.theme["table_bg"], bd=0)
+        self.list_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.vsb = AutoScrollbar(list_frame, orient="vertical")
-        self.hsb = AutoScrollbar(list_frame, orient="horizontal")
+        self.vsb = AutoScrollbar(self.list_frame, orient="vertical")
+        self.hsb = AutoScrollbar(self.list_frame, orient="horizontal")
 
         columns = [col[0] for col in BASE_TABLE_COLUMNS]
         self.tree = ttk.Treeview(
-            list_frame,
+            self.list_frame,
             columns=columns,
             show="headings",
             selectmode="browse",
@@ -1021,8 +1484,8 @@ class FlashGetApp(tk.Tk):
         self.vsb.grid(row=0, column=1, sticky="ns")
         self.hsb.grid(row=1, column=0, sticky="ew")
 
-        list_frame.grid_rowconfigure(0, weight=1)
-        list_frame.grid_columnconfigure(0, weight=1)
+        self.list_frame.grid_rowconfigure(0, weight=1)
+        self.list_frame.grid_columnconfigure(0, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_table_selected)
         self.tree.bind("<Double-1>", self._on_table_double_click)
@@ -1121,15 +1584,7 @@ class FlashGetApp(tk.Tk):
 
     # ================= 4. Context Menu =================
     def _build_context_menu(self):
-        self.ctx_menu = tk.Menu(
-            self,
-            tearoff=0,
-            font=("Microsoft YaHei UI", self.s(9)),
-            bg=self.theme["menu_bg"],
-            fg=self.theme["menu_fg"],
-            activebackground=self.theme["select_bg"],
-            activeforeground="#FFFFFF"
-        )
+        self.ctx_menu = self._create_themed_menu()
         self.ctx_menu.add_command(label="打开文件", accelerator="Enter", command=self.open_selected_file)
         self.ctx_menu.add_command(label="打开所在文件夹", command=self.open_selected_dir)
         self.ctx_menu.add_command(label="删除本地文件 (保留记录)", command=self.delete_selected_file_only)
@@ -1137,6 +1592,7 @@ class FlashGetApp(tk.Tk):
         self.ctx_menu.add_command(label="开始 / 继续下载", command=self.resume_selected_task)
         self.ctx_menu.add_command(label="暂停下载", command=self.pause_selected_task)
         self.ctx_menu.add_command(label="查看下载详情与分块...", command=self.open_selected_detail_window)
+        self.ctx_menu.add_command(label="🔍 文件完整性校验 (MD5/SHA256)...", command=self.open_selected_checksum_dialog)
         self.ctx_menu.add_separator()
         self.ctx_menu.add_command(label="从列表中移除", accelerator="Del", command=self.delete_selected_task)
         self.ctx_menu.add_command(label="彻底删除 (包含本地文件)", accelerator="Shift+Del", command=lambda: self.delete_selected_task(delete_file=True))
@@ -1260,7 +1716,10 @@ class FlashGetApp(tk.Tk):
         except Exception:
             pass
 
-        set_window_dark_titlebar(dialog, self.theme["is_dark"])
+        t = self.theme
+        card_bg = t["card_bg"]
+        dialog.configure(bg=t["bg"])
+        set_window_dark_titlebar(dialog, t["is_dark"])
 
         if not initial_url:
             try:
@@ -1276,11 +1735,11 @@ class FlashGetApp(tk.Tk):
         threads_var = tk.IntVar(value=self.default_threads)
         status_var = tk.StringVar(value="准备就绪" if not cookies else "已关联浏览器 Cookie 和 Referer")
 
-        pad_f = tk.Frame(dialog, padx=self.s(16), pady=self.s(14))
+        pad_f = tk.Frame(dialog, padx=self.s(18), pady=self.s(16), bg=t["bg"])
         pad_f.pack(fill=tk.BOTH, expand=True)
 
         # 1. 底部操作按钮栏优先使用 side=BOTTOM 放置，确保永远不会被上方挤压或截断
-        btn_bar = tk.Frame(pad_f)
+        btn_bar = tk.Frame(pad_f, bg=t["bg"])
         btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(10), 0))
 
         # 2. 状态提示栏使用 side=BOTTOM 紧贴按钮栏上方，并支持自动换行
@@ -1288,51 +1747,52 @@ class FlashGetApp(tk.Tk):
             pad_f,
             textvariable=status_var,
             font=("Microsoft YaHei UI", self.s(8)),
-            fg="#0284C7",
+            fg="#38BDF8" if t["is_dark"] else "#0284C7",
+            bg=t["bg"],
             anchor="w",
             justify=tk.LEFT,
             wraplength=self.s(520)
         )
-        status_lbl.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(4), self.s(4)))
+        status_lbl.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(6), self.s(2)))
 
-        # 3. 上方表单区域
-        content_f = tk.Frame(pad_f)
+        # 3. 上方卡片表单区域
+        content_f = tk.Frame(pad_f, bg=card_bg, padx=self.s(14), pady=self.s(12), highlightthickness=1, highlightbackground=t["border"])
         content_f.pack(fill=tk.BOTH, expand=True)
 
         fnt_bold = ("Microsoft YaHei UI", self.s(9), "bold")
         fnt_norm = ("Microsoft YaHei UI", self.s(9))
         fnt_code = ("Consolas", self.s(9))
 
-        tk.Label(content_f, text="地址 (URL):", font=fnt_bold).pack(anchor="w")
-        url_box = tk.Frame(content_f)
-        url_box.pack(fill=tk.X, pady=(self.s(2), self.s(6)))
-        url_entry = ttk.Entry(url_box, textvariable=url_var, font=fnt_code)
+        tk.Label(content_f, text="地址 (URL):", font=fnt_bold, fg=t["fg"], bg=card_bg).pack(anchor="w")
+        url_box = tk.Frame(content_f, bg=card_bg)
+        url_box.pack(fill=tk.X, pady=(self.s(3), self.s(8)))
+        url_entry = ttk.Entry(url_box, textvariable=url_var, font=fnt_code, style="Dialog.TEntry")
         url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6)))
-        btn_probe = ttk.Button(url_box, text="🔍 检测", width=7)
+        btn_probe = ttk.Button(url_box, text="🔍 检测", width=8, style="Dialog.TButton")
         btn_probe.pack(side=tk.RIGHT)
 
-        tk.Label(content_f, text="保存至:", font=fnt_bold).pack(anchor="w")
-        dir_box = tk.Frame(content_f)
-        dir_box.pack(fill=tk.X, pady=(self.s(2), self.s(6)))
-        ttk.Entry(dir_box, textvariable=dir_var, font=fnt_norm).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6)))
+        tk.Label(content_f, text="保存至:", font=fnt_bold, fg=t["fg"], bg=card_bg).pack(anchor="w")
+        dir_box = tk.Frame(content_f, bg=card_bg)
+        dir_box.pack(fill=tk.X, pady=(self.s(3), self.s(8)))
+        ttk.Entry(dir_box, textvariable=dir_var, font=fnt_norm, style="Dialog.TEntry").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6)))
         def browse_d():
             d = filedialog.askdirectory(initialdir=dir_var.get())
             if d:
                 dir_var.set(d)
-        ttk.Button(dir_box, text="📂 浏览...", width=7, command=browse_d).pack(side=tk.RIGHT)
+        ttk.Button(dir_box, text="📂 浏览...", width=8, command=browse_d, style="Dialog.TButton").pack(side=tk.RIGHT)
 
-        meta_box = tk.Frame(content_f)
-        meta_box.pack(fill=tk.X, pady=(self.s(2), self.s(6)))
+        meta_box = tk.Frame(content_f, bg=card_bg)
+        meta_box.pack(fill=tk.X, pady=(self.s(2), self.s(2)))
 
-        fn_left = tk.Frame(meta_box)
-        fn_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(10)))
-        tk.Label(fn_left, text="另存为 (文件名):", font=fnt_bold).pack(anchor="w")
-        ttk.Entry(fn_left, textvariable=fn_var, font=fnt_norm).pack(fill=tk.X, pady=(self.s(2), 0))
+        fn_left = tk.Frame(meta_box, bg=card_bg)
+        fn_left.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(12)))
+        tk.Label(fn_left, text="另存为 (文件名):", font=fnt_bold, fg=t["fg"], bg=card_bg).pack(anchor="w")
+        ttk.Entry(fn_left, textvariable=fn_var, font=fnt_norm, style="Dialog.TEntry").pack(fill=tk.X, pady=(self.s(3), 0))
 
-        th_right = tk.Frame(meta_box)
+        th_right = tk.Frame(meta_box, bg=card_bg)
         th_right.pack(side=tk.RIGHT)
-        tk.Label(th_right, text="并发连接数:", font=fnt_bold).pack(anchor="w")
-        ttk.Spinbox(th_right, from_=1, to=32, textvariable=threads_var, width=6, font=fnt_norm).pack(pady=(self.s(2), 0))
+        tk.Label(th_right, text="并发连接数:", font=fnt_bold, fg=t["fg"], bg=card_bg).pack(anchor="w")
+        ttk.Spinbox(th_right, from_=1, to=32, textvariable=threads_var, width=6, font=fnt_norm, style="Dialog.TSpinbox").pack(pady=(self.s(3), 0))
 
         def do_probe():
             u = url_var.get().strip()
@@ -1408,14 +1868,172 @@ class FlashGetApp(tk.Tk):
             self.refresh_table()
             dialog.destroy()
 
-        ttk.Button(btn_bar, text="▶️ 开始下载", command=on_start_now).pack(side=tk.RIGHT, padx=self.s(4))
-        ttk.Button(btn_bar, text="稍后下载", command=on_download_later).pack(side=tk.RIGHT, padx=self.s(4))
-        ttk.Button(btn_bar, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=self.s(4))
-        setup_dialog_geometry(dialog, self, min_width=560, min_height=320, scale_func=self.s)
+        ttk.Button(btn_bar, text="▶️ 开始下载", command=on_start_now, style="Accent.TButton").pack(side=tk.RIGHT, padx=(self.s(6), 0))
+        ttk.Button(btn_bar, text="稍后下载", command=on_download_later, style="Dialog.TButton").pack(side=tk.RIGHT, padx=self.s(4))
+        ttk.Button(btn_bar, text="取消", command=dialog.destroy, style="Dialog.TButton").pack(side=tk.RIGHT, padx=self.s(4))
+        setup_dialog_geometry(dialog, self, min_width=580, min_height=340, scale_func=self.s)
+
+    def _sync_engine_runtime_settings(self):
+        """Sync rate limit and proxy settings from persistent store into core engine globals."""
+        s = self.history_mgr.settings
+        try:
+            kbps = max(0, int(s.get("speed_limit_kbps", 0) or 0))
+        except Exception:
+            kbps = 0
+        GLOBAL_RATE_LIMITER.set_limit_kbps(kbps)
+
+        mode = str(s.get("proxy_mode", "auto") or "auto").lower()
+        if mode not in ("auto", "system", "direct", "custom"):
+            mode = "auto"
+        GLOBAL_PROXY_CONFIG["mode"] = mode
+        GLOBAL_PROXY_CONFIG["custom_proxy"] = str(s.get("custom_proxy", "") or "").strip()
+
+    def _get_max_concurrent_tasks(self) -> int:
+        try:
+            return max(1, min(10, int(self.history_mgr.settings.get("max_concurrent_tasks", 3) or 3)))
+        except Exception:
+            return 3
+
+    def _on_task_finished(self, task: DownloadTask, final_status: str):
+        """Handle queue promotion and post-download automation after a task stops/completes."""
+        self.refresh_table()
+        started_next = self._process_download_queue()
+        if final_status == "completed" and not started_next:
+            active_or_queued = any(t.status in ("downloading", "queued") for t in self.history_mgr.tasks)
+            if not active_or_queued:
+                self._trigger_post_download_action(task)
+
+    def _process_download_queue(self) -> bool:
+        """Promote queued tasks up to max_concurrent_tasks in FIFO chronological order."""
+        max_conc = self._get_max_concurrent_tasks()
+        active_cnt = sum(1 for t in self.history_mgr.tasks if t.status == "downloading")
+        started_any = False
+        if active_cnt >= max_conc:
+            return False
+        # Reverse so earlier-created queued tasks launch first
+        for q_task in reversed(self.history_mgr.tasks):
+            if active_cnt >= max_conc:
+                break
+            if q_task.status == "queued":
+                self.start_task(q_task, open_monitor=False)
+                active_cnt += 1
+                started_any = True
+        return started_any
+
+    def _trigger_post_download_action(self, last_task: Optional[DownloadTask] = None):
+        action = self.history_mgr.settings.get("post_download_action", "none")
+        if action == "open_dir" and last_task and last_task.save_dir and os.path.exists(last_task.save_dir):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(last_task.save_dir)
+            except Exception:
+                pass
+        elif action == "shutdown":
+            self._show_shutdown_countdown_dialog()
+
+    def _show_shutdown_countdown_dialog(self):
+        """Cancelable 30s countdown dialog before automatic shutdown after all downloads complete."""
+        if getattr(self, "_shutdown_dlg", None) and self._shutdown_dlg.winfo_exists():
+            return
+        t = self.theme
+        dlg = tk.Toplevel(self)
+        self._shutdown_dlg = dlg
+        apply_window_icon(dlg)
+        dlg.title("⚡ 全部下载已完成 - 自动关机提示")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=t["bg"])
+        set_window_dark_titlebar(dlg, t["is_dark"])
+
+        pad_f = tk.Frame(dlg, padx=self.s(20), pady=self.s(18), bg=t["bg"])
+        pad_f.pack(fill=tk.BOTH, expand=True)
+        btn_bar = tk.Frame(pad_f, bg=t["bg"])
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(16), 0))
+
+        tk.Label(
+            pad_f,
+            text="全部队列下载任务已完成",
+            font=("Microsoft YaHei UI", self.s(10), "bold"),
+            fg=t["fg"],
+            bg=t["bg"]
+        ).pack(anchor="w")
+
+        rem = [30]
+        cancelled = [False]
+        timer_id = [None]
+        lbl = tk.Label(
+            pad_f,
+            text=f"电脑将在 {rem[0]} 秒后自动关机，您可随时取消。",
+            font=("Microsoft YaHei UI", self.s(9)),
+            fg=t["hint_fg"],
+            bg=t["bg"]
+        )
+        lbl.pack(anchor="w", pady=(self.s(6), 0))
+
+        def do_cancel():
+            cancelled[0] = True
+            if timer_id[0]:
+                try:
+                    self.after_cancel(timer_id[0])
+                except Exception:
+                    pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def do_shutdown_now():
+            cancelled[0] = True
+            if timer_id[0]:
+                try:
+                    self.after_cancel(timer_id[0])
+                except Exception:
+                    pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            if sys.platform == "win32":
+                try:
+                    subprocess.Popen(["shutdown", "/s", "/t", "5", "/c", "FlashGet 全部下载完成，即将关机"], creationflags=0x08000000)
+                except Exception:
+                    pass
+
+        def tick():
+            if cancelled[0]:
+                return
+            rem[0] -= 1
+            if rem[0] <= 0:
+                do_shutdown_now()
+            else:
+                try:
+                    if dlg.winfo_exists():
+                        lbl.configure(text=f"电脑将在 {rem[0]} 秒后自动关机，您可随时取消。")
+                        timer_id[0] = self.after(1000, tick)
+                except Exception:
+                    pass
+
+        timer_id[0] = self.after(1000, tick)
+        ttk.Button(btn_bar, text="立即关机", command=do_shutdown_now, style="Dialog.TButton").pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="取消关机", command=do_cancel, style="Accent.TButton").pack(side=tk.RIGHT, padx=self.s(8))
+        dlg.protocol("WM_DELETE_WINDOW", do_cancel)
+        setup_dialog_geometry(dlg, self, min_width=420, min_height=160, scale_func=self.s)
 
     def start_task(self, task: DownloadTask, open_monitor: bool = False):
         if task.status == "downloading":
             return
+
+        active_cnt = sum(1 for t in self.history_mgr.tasks if t.status == "downloading" and t.id != task.id)
+        if active_cnt >= self._get_max_concurrent_tasks():
+            task.status = "queued"
+            task.speed = 0.0
+            task.eta = 0.0
+            self.history_mgr.save()
+            self.refresh_table()
+            return
+
+        self._sync_engine_runtime_settings()
         task.status = "downloading"
         self.refresh_table()
 
@@ -1425,7 +2043,10 @@ class FlashGetApp(tk.Tk):
             filename=task.filename,
             num_threads=task.threads,
             custom_cookies=task.custom_cookies,
-            custom_referer=task.custom_referer
+            custom_referer=task.custom_referer,
+            rate_limiter=GLOBAL_RATE_LIMITER,
+            proxy_mode=GLOBAL_PROXY_CONFIG.get("mode", "auto"),
+            custom_proxy=GLOBAL_PROXY_CONFIG.get("custom_proxy", "")
         )
         task.engine = engine
         self.active_engines[task.id] = engine
@@ -1448,17 +2069,20 @@ class FlashGetApp(tk.Tk):
                 self.history_mgr.save()
                 # 下载完成后自动关闭该任务的详情监视窗口
                 self.after(500, lambda: self._close_task_detail_window(task.id))
+                self.after(50, lambda: self._on_task_finished(task, "completed"))
             elif status in ("paused", "cancelled"):
                 task.status = "paused"
                 task.speed = 0.0
                 task.eta = 0.0
                 self.history_mgr.save()
+                self.after(50, lambda st=status: self._on_task_finished(task, st))
             elif status == "error":
                 task.status = "error"
                 task.error_msg = msg
                 task.speed = 0.0
                 task.eta = 0.0
                 self.history_mgr.save()
+                self.after(50, lambda: self._on_task_finished(task, "error"))
 
         engine.on_progress = on_engine_progress
         engine.on_status_change = on_engine_status
@@ -1477,19 +2101,25 @@ class FlashGetApp(tk.Tk):
         apply_window_icon(win)
         win.title(f"⏬ 下载状态 - {task.filename or task.url[:25]}")
         win.resizable(True, True)
+        win.configure(bg=self.theme["bg"])
         self.detail_windows[task.id] = win
 
-        set_window_dark_titlebar(win, self.theme["is_dark"])
+        t = self.theme
+        card_bg = t["card_bg"]
+        hint_fg = t["hint_fg"]
+        accent_fg = t["accent_fg"]
 
-        main_f = tk.Frame(win, padx=self.s(14), pady=self.s(12), bg=self.theme["bg"])
+        set_window_dark_titlebar(win, t["is_dark"])
+
+        main_f = tk.Frame(win, padx=self.s(14), pady=self.s(12), bg=t["bg"])
         main_f.pack(fill=tk.BOTH, expand=True)
 
         # 1. 底部操作栏优先绝对吸附在窗口最下方，100% 保证可见且绝不会被挤压
-        btn_bar = tk.Frame(main_f, bg=self.theme["bg"])
+        btn_bar = tk.Frame(main_f, bg=t["bg"])
         btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(8), 0))
-        btn_win_pause = ttk.Button(btn_bar, text="⏸️ 暂停", width=10)
+        btn_win_pause = ttk.Button(btn_bar, text="⏸️ 暂停", width=10, style="Dialog.TButton")
         btn_win_pause.pack(side=tk.LEFT, padx=(0, self.s(8)))
-        btn_win_resume = ttk.Button(btn_bar, text="▶️ 继续", width=10)
+        btn_win_resume = ttk.Button(btn_bar, text="▶️ 继续", width=10, style="Dialog.TButton")
         btn_win_resume.pack(side=tk.LEFT, padx=self.s(3))
 
         def toggle_pause():
@@ -1505,62 +2135,62 @@ class FlashGetApp(tk.Tk):
 
         # 2. 顶部文件概要卡片 (极简高雅)
         fn_var = tk.StringVar(value=task.filename or "检测中...")
-        fn_card = tk.Frame(main_f, bg=self.theme["table_bg"], padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=self.theme["border"])
+        fn_card = tk.Frame(main_f, bg=card_bg, padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=t["border"])
         fn_card.pack(fill=tk.X, side=tk.TOP, pady=(0, self.s(10)))
 
-        tk.Label(fn_card, text="📄", font=("Segoe UI Emoji", self.s(14)), bg=self.theme["table_bg"]).pack(side=tk.LEFT, padx=(0, self.s(8)))
+        tk.Label(fn_card, text="📄", font=("Segoe UI Emoji", self.s(14)), bg=card_bg).pack(side=tk.LEFT, padx=(0, self.s(8)))
         tk.Label(
             fn_card,
             textvariable=fn_var,
             font=("Microsoft YaHei UI", self.s(10), "bold"),
-            fg=self.theme["fg"],
-            bg=self.theme["table_bg"],
+            fg=t["fg"],
+            bg=card_bg,
             anchor="w"
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # 3. 核心大数字仪表盘 (3 个大指标清晰直观)
-        metrics_bar = tk.Frame(main_f, bg=self.theme["bg"])
+        metrics_bar = tk.Frame(main_f, bg=t["bg"])
         metrics_bar.pack(fill=tk.X, side=tk.TOP, pady=(0, self.s(10)))
 
         # (1) 进度百分比
-        pct_card = tk.Frame(metrics_bar, bg=self.theme["table_bg"], padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=self.theme["border"])
+        pct_card = tk.Frame(metrics_bar, bg=card_bg, padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=t["border"])
         pct_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, self.s(6)))
-        tk.Label(pct_card, text="当前进度", font=("Microsoft YaHei UI", self.s(8)), fg="#94A3B8", bg=self.theme["table_bg"]).pack(anchor="w")
+        tk.Label(pct_card, text="当前进度", font=("Microsoft YaHei UI", self.s(8)), fg=hint_fg, bg=card_bg).pack(anchor="w")
         pct_var = tk.StringVar(value="0.0 %")
-        tk.Label(pct_card, textvariable=pct_var, font=("Microsoft YaHei UI", self.s(14), "bold"), fg="#38BDF8", bg=self.theme["table_bg"]).pack(anchor="w")
+        tk.Label(pct_card, textvariable=pct_var, font=("Microsoft YaHei UI", self.s(14), "bold"), fg=accent_fg, bg=card_bg).pack(anchor="w")
 
         # (2) 传输实时速度
-        speed_card = tk.Frame(metrics_bar, bg=self.theme["table_bg"], padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=self.theme["border"])
+        speed_card = tk.Frame(metrics_bar, bg=card_bg, padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=t["border"])
         speed_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=self.s(3))
-        tk.Label(speed_card, text="实时速度", font=("Microsoft YaHei UI", self.s(8)), fg="#94A3B8", bg=self.theme["table_bg"]).pack(anchor="w")
+        tk.Label(speed_card, text="实时速度", font=("Microsoft YaHei UI", self.s(8)), fg=hint_fg, bg=card_bg).pack(anchor="w")
         speed_var = tk.StringVar(value="0.00 B/s")
-        tk.Label(speed_card, textvariable=speed_var, font=("Microsoft YaHei UI", self.s(14), "bold"), fg="#22C55E", bg=self.theme["table_bg"]).pack(anchor="w")
+        tk.Label(speed_card, textvariable=speed_var, font=("Microsoft YaHei UI", self.s(14), "bold"), fg="#22C55E" if t["is_dark"] else "#16A34A", bg=card_bg).pack(anchor="w")
 
         # (3) 预估剩余时间 / 大小
-        eta_card = tk.Frame(metrics_bar, bg=self.theme["table_bg"], padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=self.theme["border"])
+        eta_card = tk.Frame(metrics_bar, bg=card_bg, padx=self.s(10), pady=self.s(8), highlightthickness=1, highlightbackground=t["border"])
         eta_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(self.s(6), 0))
-        tk.Label(eta_card, text="预估剩余", font=("Microsoft YaHei UI", self.s(8)), fg="#94A3B8", bg=self.theme["table_bg"]).pack(anchor="w")
+        tk.Label(eta_card, text="预估剩余", font=("Microsoft YaHei UI", self.s(8)), fg=hint_fg, bg=card_bg).pack(anchor="w")
         eta_var = tk.StringVar(value="--:--")
-        tk.Label(eta_card, textvariable=eta_var, font=("Microsoft YaHei UI", self.s(14), "bold"), fg="#F59E0B", bg=self.theme["table_bg"]).pack(anchor="w")
+        tk.Label(eta_card, textvariable=eta_var, font=("Microsoft YaHei UI", self.s(14), "bold"), fg="#F59E0B" if t["is_dark"] else "#D97706", bg=card_bg).pack(anchor="w")
 
         # 4. 总体动态主进度条
-        prog_header = tk.Frame(main_f, bg=self.theme["bg"])
+        prog_header = tk.Frame(main_f, bg=t["bg"])
         prog_header.pack(fill=tk.X, side=tk.TOP, pady=(self.s(2), self.s(2)))
         prog_str_var = tk.StringVar(value="0 B / 0 B")
-        tk.Label(prog_header, text="总下载进度", font=("Microsoft YaHei UI", self.s(8), "bold"), fg=self.theme["fg"], bg=self.theme["bg"]).pack(side=tk.LEFT)
-        tk.Label(prog_header, textvariable=prog_str_var, font=("Microsoft YaHei UI", self.s(8)), fg="#94A3B8", bg=self.theme["bg"]).pack(side=tk.RIGHT)
+        tk.Label(prog_header, text="总下载进度", font=("Microsoft YaHei UI", self.s(8), "bold"), fg=t["fg"], bg=t["bg"]).pack(side=tk.LEFT)
+        tk.Label(prog_header, textvariable=prog_str_var, font=("Microsoft YaHei UI", self.s(8)), fg=hint_fg, bg=t["bg"]).pack(side=tk.RIGHT)
 
-        big_pbar = ttk.Progressbar(main_f, orient="horizontal", mode="determinate")
+        big_pbar = ttk.Progressbar(main_f, orient="horizontal", mode="determinate", style="Horizontal.TProgressbar")
         big_pbar.pack(fill=tk.X, side=tk.TOP, pady=(self.s(2), self.s(10)))
 
         # 5. IDM 标志性“多线程分块网格仪表” (自适应填充剩余所有高度)
-        grid_header = tk.Frame(main_f, bg=self.theme["bg"])
+        grid_header = tk.Frame(main_f, bg=t["bg"])
         grid_header.pack(fill=tk.X, side=tk.TOP, pady=(0, self.s(4)))
-        tk.Label(grid_header, text="多线程并发连接监控", font=("Microsoft YaHei UI", self.s(8), "bold"), fg=self.theme["fg"], bg=self.theme["bg"]).pack(side=tk.LEFT)
+        tk.Label(grid_header, text="多线程并发连接监控", font=("Microsoft YaHei UI", self.s(8), "bold"), fg=t["fg"], bg=t["bg"]).pack(side=tk.LEFT)
         threads_lbl_var = tk.StringVar(value=f"{task.threads} 线程并行")
-        tk.Label(grid_header, textvariable=threads_lbl_var, font=("Microsoft YaHei UI", self.s(8)), fg="#0284C7", bg=self.theme["bg"]).pack(side=tk.RIGHT)
+        tk.Label(grid_header, textvariable=threads_lbl_var, font=("Microsoft YaHei UI", self.s(8)), fg=accent_fg, bg=t["bg"]).pack(side=tk.RIGHT)
 
-        seg_box = tk.Frame(main_f, bg=self.theme["table_bg"], padx=self.s(8), pady=self.s(6), highlightthickness=1, highlightbackground=self.theme["border"])
+        seg_box = tk.Frame(main_f, bg=card_bg, padx=self.s(8), pady=self.s(6), highlightthickness=1, highlightbackground=t["border"])
         seg_box.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
 
         chunk_bars = []
@@ -1570,15 +2200,15 @@ class FlashGetApp(tk.Tk):
         cols = 2 if threads_count > 4 else 1
 
         for i in range(threads_count):
-            r = tk.Frame(seg_box, bg=self.theme["table_bg"], pady=1)
+            r = tk.Frame(seg_box, bg=card_bg, pady=1)
             r.grid(row=i if cols == 1 else i // 2, column=0 if cols == 1 else i % 2, sticky="ew", padx=self.s(6))
             seg_box.grid_columnconfigure(0 if cols == 1 else i % 2, weight=1)
 
-            lbl = tk.Label(r, text=f"#{i+1:02d}", font=("Consolas", self.s(8), "bold"), width=4, anchor="w", fg="#94A3B8", bg=self.theme["table_bg"])
+            lbl = tk.Label(r, text=f"#{i+1:02d}", font=("Consolas", self.s(8), "bold"), width=4, anchor="w", fg=hint_fg, bg=card_bg)
             lbl.pack(side=tk.LEFT)
-            pb = ttk.Progressbar(r, orient="horizontal", mode="determinate")
+            pb = ttk.Progressbar(r, orient="horizontal", mode="determinate", style="Horizontal.TProgressbar")
             pb.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=self.s(4))
-            pct_lbl = tk.Label(r, text="0%", font=("Consolas", self.s(8)), width=5, anchor="e", fg="#38BDF8", bg=self.theme["table_bg"])
+            pct_lbl = tk.Label(r, text="0%", font=("Consolas", self.s(8)), width=5, anchor="e", fg=accent_fg, bg=card_bg)
             pct_lbl.pack(side=tk.RIGHT)
 
             chunk_bars.append(pb)
@@ -1656,18 +2286,33 @@ class FlashGetApp(tk.Tk):
             messagebox.showinfo("提示", "请先在列表中选中一个任务！")
             return
         task = self.history_mgr.get_task(self.selected_task_id)
-        if task and task.engine:
+        if not task:
+            return
+        if task.engine and task.status == "downloading":
             task.engine.pause()
             task.status = "paused"
             task.speed = 0.0
+            self.history_mgr.save()
+            self.refresh_table()
+            self._process_download_queue()
+        elif task.status == "queued":
+            task.status = "paused"
+            task.speed = 0.0
+            self.history_mgr.save()
             self.refresh_table()
 
     def stop_all_tasks(self):
+        # First convert queued tasks to paused so pausing active engines doesn't immediately start queued ones
+        for task in self.history_mgr.tasks:
+            if task.status == "queued":
+                task.status = "paused"
+                task.speed = 0.0
         for task in self.history_mgr.tasks:
             if task.engine and task.status == "downloading":
                 task.engine.pause()
                 task.status = "paused"
                 task.speed = 0.0
+        self.history_mgr.save()
         self.refresh_table()
 
     def delete_selected_file_only(self):
@@ -1750,6 +2395,7 @@ class FlashGetApp(tk.Tk):
             self.history_mgr.remove_task(task.id, delete_file=delete_file)
             self.selected_task_id = None
             self.refresh_table()
+            self._process_download_queue()
 
     def delete_all_tasks(self):
         if not self.history_mgr.tasks:
@@ -1759,6 +2405,197 @@ class FlashGetApp(tk.Tk):
             for t in list(self.history_mgr.tasks):
                 self.history_mgr.remove_task(t.id, delete_file=False)
             self.refresh_table()
+
+    def open_selected_checksum_dialog(self):
+        """打开文件完整性校验弹窗（支持 MD5 / SHA-1 / SHA-256 计算与对比）"""
+        target_path = ""
+        if self.selected_task_id:
+            task = self.history_mgr.get_task(self.selected_task_id)
+            if task and task.file_path and os.path.isfile(task.file_path):
+                target_path = task.file_path
+            elif task and task.status != "completed":
+                messagebox.showinfo("提示", "该任务尚未下载完成，请选择已完成任务或点击弹窗内的“选择本地文件”进行校验。")
+        self.open_checksum_dialog(initial_path=target_path)
+
+    def open_checksum_dialog(self, initial_path: str = ""):
+        """完整性校验工具对话框（单遍流式计算 MD5 / SHA-1 / SHA-256 并实时对比）"""
+        t = self.theme
+        card_bg = t["card_bg"]
+        hint_fg = t["hint_fg"]
+        accent_fg = t["accent_fg"]
+
+        dlg = tk.Toplevel(self)
+        apply_window_icon(dlg)
+        dlg.title("🔍 文件完整性校验 (MD5 / SHA-1 / SHA-256)")
+        dlg.resizable(True, True)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=t["bg"])
+        set_window_dark_titlebar(dlg, t["is_dark"])
+
+        pad_f = tk.Frame(dlg, padx=self.s(18), pady=self.s(16), bg=t["bg"])
+        pad_f.pack(fill=tk.BOTH, expand=True)
+
+        btn_bar = tk.Frame(pad_f, bg=t["bg"])
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(12), 0))
+
+        content_f = tk.Frame(pad_f, bg=t["bg"])
+        content_f.pack(fill=tk.BOTH, expand=True)
+
+        fnt_lbl = ("Microsoft YaHei UI", self.s(9), "bold")
+        fnt_norm = ("Microsoft YaHei UI", self.s(9))
+        fnt_code = ("Consolas", self.s(9))
+        fnt_hint = ("Microsoft YaHei UI", self.s(8))
+
+        cancel_holder = [threading.Event()]
+
+        # Card 1: 目标文件与进度
+        c1 = tk.Frame(content_f, bg=card_bg, padx=self.s(14), pady=self.s(10), highlightthickness=1, highlightbackground=t["border"])
+        c1.pack(fill=tk.X, pady=(0, self.s(10)))
+
+        tk.Label(c1, text="目标文件:", font=fnt_lbl, fg=t["fg"], bg=card_bg).pack(anchor="w")
+        file_row = tk.Frame(c1, bg=card_bg)
+        file_row.pack(fill=tk.X, pady=(self.s(4), self.s(6)))
+        path_var = tk.StringVar(value=initial_path)
+        ttk.Entry(file_row, textvariable=path_var, font=fnt_norm, state="readonly", style="Dialog.TEntry").pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6))
+        )
+
+        status_var = tk.StringVar(value="请选择本地文件开始计算校验和" if not initial_path else "准备就绪，正在读取文件...")
+        tk.Label(c1, textvariable=status_var, font=fnt_hint, fg=accent_fg, bg=card_bg).pack(anchor="w")
+        pbar = ttk.Progressbar(c1, orient="horizontal", mode="determinate", style="Horizontal.TProgressbar")
+        pbar.pack(fill=tk.X, pady=(self.s(4), 0))
+
+        # Card 2: 校验和结果
+        c2 = tk.Frame(content_f, bg=card_bg, padx=self.s(14), pady=self.s(10), highlightthickness=1, highlightbackground=t["border"])
+        c2.pack(fill=tk.X, pady=(0, self.s(10)))
+        c2.columnconfigure(0, minsize=self.s(72))
+        c2.columnconfigure(1, weight=1)
+
+        md5_var = tk.StringVar(value="-")
+        sha1_var = tk.StringVar(value="-")
+        sha256_var = tk.StringVar(value="-")
+
+        def make_hash_row(row_idx: int, label_txt: str, var: tk.StringVar):
+            tk.Label(c2, text=label_txt, font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+                row=row_idx, column=0, sticky="w", pady=self.s(3)
+            )
+            box = tk.Frame(c2, bg=card_bg)
+            box.grid(row=row_idx, column=1, sticky="ew", pady=self.s(3))
+            ttk.Entry(box, textvariable=var, font=fnt_code, state="readonly", style="Dialog.TEntry").pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6))
+            )
+            def copy_v():
+                v = var.get().strip()
+                if v and v != "-":
+                    self.clipboard_clear()
+                    self.clipboard_append(v)
+                    status_var.set(f"已复制 {label_txt} 校验值到剪贴板")
+            ttk.Button(box, text="复制", width=6, command=copy_v, style="Dialog.TButton").pack(side=tk.RIGHT)
+
+        make_hash_row(0, "MD5", md5_var)
+        make_hash_row(1, "SHA-1", sha1_var)
+        make_hash_row(2, "SHA-256", sha256_var)
+
+        # Card 3: 预期值比对
+        c3 = tk.Frame(content_f, bg=card_bg, padx=self.s(14), pady=self.s(10), highlightthickness=1, highlightbackground=t["border"])
+        c3.pack(fill=tk.X)
+        tk.Label(c3, text="对比官网校验值 (粘贴 MD5 / SHA-1 / SHA-256 自动识别):", font=fnt_lbl, fg=t["fg"], bg=card_bg).pack(anchor="w")
+        expected_var = tk.StringVar()
+        exp_entry = ttk.Entry(c3, textvariable=expected_var, font=fnt_code, style="Dialog.TEntry")
+        exp_entry.pack(fill=tk.X, pady=(self.s(4), self.s(6)))
+
+        match_var = tk.StringVar(value="等待计算完成后，可粘贴目标校验值自动对比")
+        match_lbl = tk.Label(c3, textvariable=match_var, font=fnt_norm, fg=hint_fg, bg=card_bg)
+        match_lbl.pack(anchor="w")
+
+        def evaluate_match(*_):
+            exp = expected_var.get().strip().lower().replace(" ", "")
+            if not exp:
+                match_var.set("输入或粘贴预期校验值后将自动对比（不区分大小写）")
+                match_lbl.configure(fg=hint_fg)
+                return
+            hashes = {
+                "MD5": md5_var.get().strip().lower(),
+                "SHA-1": sha1_var.get().strip().lower(),
+                "SHA-256": sha256_var.get().strip().lower(),
+            }
+            if all(v in ("", "-") for v in hashes.values()):
+                match_var.set("正在等待哈希值计算完成...")
+                match_lbl.configure(fg=hint_fg)
+                return
+            for alg_name, actual in hashes.items():
+                if actual == exp:
+                    match_var.set(f"✅ 校验通过！文件完整无损（匹配 {alg_name}）")
+                    match_lbl.configure(fg="#22C55E" if t["is_dark"] else "#16A34A")
+                    return
+            match_var.set("❌ 校验不匹配！文件可能已损坏或不完整，请谨慎使用")
+            match_lbl.configure(fg="#F87171" if t["is_dark"] else "#DC2626")
+
+        expected_var.trace_add("write", evaluate_match)
+
+        def start_hash_worker(fpath: str):
+            if not fpath or not os.path.isfile(fpath):
+                status_var.set("本地文件不存在或路径无效")
+                return
+            cancel_holder[0].set()
+            ev = threading.Event()
+            cancel_holder[0] = ev
+            md5_var.set("计算中...")
+            sha1_var.set("计算中...")
+            sha256_var.set("计算中...")
+            pbar["value"] = 0
+            fsize = os.path.getsize(fpath)
+            status_var.set(f"正在计算文件摘要 ({format_bytes(fsize)})...")
+
+            def worker():
+                try:
+                    def on_prog(done, tot):
+                        if ev.is_set() or not dlg.winfo_exists():
+                            return
+                        pct = (done / tot * 100.0) if tot > 0 else 100.0
+                        dlg.after(0, lambda p=pct: pbar.configure(value=p) if dlg.winfo_exists() else None)
+
+                    res = compute_file_hashes(fpath, ("md5", "sha1", "sha256"), on_progress=on_prog, cancel_event=ev)
+                    if ev.is_set() or not res:
+                        return
+
+                    def on_done():
+                        if not dlg.winfo_exists():
+                            return
+                        md5_var.set(res.get("md5", "-"))
+                        sha1_var.set(res.get("sha1", "-"))
+                        sha256_var.set(res.get("sha256", "-"))
+                        pbar["value"] = 100
+                        status_var.set(f"✔ 计算完成 ({format_bytes(fsize)})")
+                        evaluate_match()
+
+                    dlg.after(0, on_done)
+                except Exception as exc:
+                    if not ev.is_set():
+                        dlg.after(0, lambda err=str(exc): status_var.set(f"计算失败: {err}") if dlg.winfo_exists() else None)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def choose_file():
+            init_dir = os.path.dirname(path_var.get()) if path_var.get() else self.default_save_dir
+            picked = filedialog.askopenfilename(initialdir=init_dir, title="选择需要校验完整性的文件", parent=dlg)
+            if picked:
+                path_var.set(picked)
+                start_hash_worker(picked)
+
+        ttk.Button(file_row, text="📂 选择本地文件...", command=choose_file, style="Dialog.TButton").pack(side=tk.RIGHT)
+
+        def on_close():
+            cancel_holder[0].set()
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", on_close)
+        ttk.Button(btn_bar, text="关闭", command=on_close, style="Accent.TButton").pack(side=tk.RIGHT)
+        setup_dialog_geometry(dlg, self, min_width=640, min_height=430, scale_func=self.s)
+
+        if initial_path and os.path.isfile(initial_path):
+            dlg.after(80, lambda: start_hash_worker(initial_path))
 
     def open_selected_file(self):
         if not self.selected_task_id:
@@ -1848,6 +2685,7 @@ class FlashGetApp(tk.Tk):
         dlg.resizable(False, False)
         dlg.transient(parent_win)
         dlg.grab_set()
+        dlg.configure(bg=self.theme["bg"])
 
         set_window_dark_titlebar(dlg, self.theme["is_dark"])
 
@@ -1913,7 +2751,7 @@ class FlashGetApp(tk.Tk):
 
             if parent_dialog and parent_dialog.winfo_exists():
                 try:
-                    setup_dialog_geometry(parent_dialog, self, min_width=520, min_height=500, scale_func=self.s)
+                    setup_dialog_geometry(parent_dialog, self, min_width=580, min_height=520, scale_func=self.s)
                 except Exception:
                     pass
 
@@ -1970,7 +2808,7 @@ class FlashGetApp(tk.Tk):
 
         timer_holder[0] = self.after(1000, tick)
 
-        btn_keep = ttk.Button(btn_bar, text="保留更改 (K)", command=do_keep, style="Dialog.TButton")
+        btn_keep = ttk.Button(btn_bar, text="保留更改 (K)", command=do_keep, style="Accent.TButton")
         btn_keep.pack(side=tk.RIGHT)
 
         btn_revert = ttk.Button(btn_bar, text="还原 (R)", command=do_revert, style="Dialog.TButton")
@@ -1993,50 +2831,92 @@ class FlashGetApp(tk.Tk):
             pass
 
     def open_settings_dialog(self):
+        t = self.theme
+        is_dark = t["is_dark"]
+        card_bg = t["card_bg"]
+        sec_fg = t["accent_fg"]
+        hint_fg = t["hint_fg"]
+
         dialog = tk.Toplevel(self)
         apply_window_icon(dialog)
         dialog.title("⚙️ FlashGet 配置选项")
         dialog.resizable(True, True)
         dialog.transient(self)
         dialog.grab_set()
+        dialog.configure(bg=t["bg"])
 
-        set_window_dark_titlebar(dialog, self.theme["is_dark"])
+        set_window_dark_titlebar(dialog, is_dark)
 
-        pad_f = tk.Frame(dialog, padx=self.s(18), pady=self.s(16))
+        pad_f = tk.Frame(dialog, padx=self.s(18), pady=self.s(16), bg=t["bg"])
         pad_f.pack(fill=tk.BOTH, expand=True)
 
         # 1. 底部按钮栏使用 side=BOTTOM 优先放置，确保绝不被上方内容挤压或遮挡
-        btn_bar = tk.Frame(pad_f)
-        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(16), 0))
+        btn_bar = tk.Frame(pad_f, bg=t["bg"])
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(self.s(14), 0))
 
         # 2. 上方配置选项内容
-        content_f = tk.Frame(pad_f)
+        content_f = tk.Frame(pad_f, bg=t["bg"])
         content_f.pack(fill=tk.BOTH, expand=True)
 
-        fnt_bold = ("Microsoft YaHei UI", self.s(9), "bold")
+        fnt_sec = ("Microsoft YaHei UI", self.s(9), "bold")
+        fnt_lbl = ("Microsoft YaHei UI", self.s(9))
         fnt_norm = ("Microsoft YaHei UI", self.s(9))
         fnt_hint = ("Microsoft YaHei UI", self.s(8))
-        row_py = (self.s(2), self.s(10))
 
-        # 1) 界面主题风格
-        tk.Label(content_f, text="界面主题风格:", font=fnt_bold).pack(anchor="w")
-        theme_box = tk.Frame(content_f)
-        theme_box.pack(fill=tk.X, pady=row_py)
+        def make_card(title_text: str, bottom_pad: int = 8) -> tk.Frame:
+            card = tk.Frame(
+                content_f,
+                bg=card_bg,
+                padx=self.s(13),
+                pady=self.s(8),
+                highlightthickness=1,
+                highlightbackground=t["border"]
+            )
+            card.pack(fill=tk.X, pady=(0, self.s(bottom_pad)))
+            tk.Label(
+                card,
+                text=title_text,
+                font=fnt_sec,
+                fg=sec_fg,
+                bg=card_bg
+            ).pack(anchor="w", pady=(0, self.s(5)))
+            grid_f = tk.Frame(card, bg=card_bg)
+            grid_f.pack(fill=tk.X)
+            grid_f.columnconfigure(0, minsize=self.s(118))
+            grid_f.columnconfigure(1, weight=1)
+            return grid_f
+
+        # ---------------- Card 1: 外观与显示 ----------------
+        g1 = make_card("🎨 外观与显示")
+
+        tk.Label(g1, text="界面主题风格", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, self.s(6))
+        )
         theme_v = tk.StringVar(value="暗黑主题 (Dark)" if self.current_theme_key == "dark" else "浅色主题 (Light)")
-        theme_combo = ttk.Combobox(theme_box, textvariable=theme_v, values=["暗黑主题 (Dark)", "浅色主题 (Light)"], state="readonly", font=fnt_norm)
-        theme_combo.pack(anchor="w")
+        theme_combo = ttk.Combobox(
+            g1,
+            textvariable=theme_v,
+            values=["暗黑主题 (Dark)", "浅色主题 (Light)"],
+            state="readonly",
+            font=fnt_norm,
+            width=22,
+            style="Dialog.TCombobox"
+        )
+        theme_combo.grid(row=0, column=1, sticky="w", pady=(0, self.s(6)))
 
-        # 2) 自定义缩放百分比 (持久化保存，仿 Windows 10秒无确认自动还原)
-        tk.Label(content_f, text="界面显示缩放比例:", font=fnt_bold).pack(anchor="w")
-        scale_box = tk.Frame(content_f)
-        scale_box.pack(fill=tk.X, pady=row_py)
+        tk.Label(g1, text="界面显示缩放", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=1, column=0, sticky="w"
+        )
+        scale_box = tk.Frame(g1, bg=card_bg)
+        scale_box.grid(row=1, column=1, sticky="ew")
         scale_v = tk.StringVar(value=f"{self.ui_scale}%")
         scale_combo = ttk.Combobox(
             scale_box,
             textvariable=scale_v,
             values=["70%", "80%", "90%", "100% (标准)", "110%", "125% (放大)", "150% (高分屏)", "175%", "200% (双倍)", "225%", "250%"],
             font=fnt_norm,
-            width=16
+            width=14,
+            style="Dialog.TCombobox"
         )
         scale_combo.pack(side=tk.LEFT)
 
@@ -2068,31 +2948,131 @@ class FlashGetApp(tk.Tk):
         scale_combo.bind("<Return>", lambda e: on_scale_apply())
 
         ttk.Button(scale_box, text="应用缩放", command=on_scale_apply, style="Dialog.TButton").pack(side=tk.LEFT, padx=(self.s(8), 0))
-        tk.Label(scale_box, text="(仿 Windows: 10秒无确认自动还原)", font=fnt_hint, fg="#94A3B8").pack(side=tk.LEFT, padx=(self.s(6), 0))
+        tk.Label(scale_box, text="10秒未确认自动还原", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(side=tk.LEFT, padx=(self.s(8), 0))
 
-        # 3) 默认文件保存目录
-        tk.Label(content_f, text="默认文件保存目录:", font=fnt_bold).pack(anchor="w")
-        dir_box = tk.Frame(content_f)
-        dir_box.pack(fill=tk.X, pady=row_py)
+        # ---------------- Card 2: 下载、队列与限速 ----------------
+        g2 = make_card("📥 下载、队列与限速")
+
+        tk.Label(g2, text="默认保存目录", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, self.s(6))
+        )
+        dir_box = tk.Frame(g2, bg=card_bg)
+        dir_box.grid(row=0, column=1, sticky="ew", pady=(0, self.s(6)))
         dir_v = tk.StringVar(value=self.default_save_dir)
-        ttk.Entry(dir_box, textvariable=dir_v, font=fnt_norm).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6)))
+        ttk.Entry(dir_box, textvariable=dir_v, font=fnt_norm, style="Dialog.TEntry").pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, self.s(6))
+        )
         def browse():
             d = filedialog.askdirectory(initialdir=dir_v.get())
             if d:
                 dir_v.set(d)
         ttk.Button(dir_box, text="浏览...", command=browse, style="Dialog.TButton").pack(side=tk.RIGHT)
 
-        # 4) 默认并发连接数
-        tk.Label(content_f, text="默认最大并发连接数 (线程数):", font=fnt_bold).pack(anchor="w")
+        tk.Label(g2, text="并发线程与队列", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=1, column=0, sticky="w", pady=(0, self.s(6))
+        )
+        th_box = tk.Frame(g2, bg=card_bg)
+        th_box.grid(row=1, column=1, sticky="ew", pady=(0, self.s(6)))
+        tk.Label(th_box, text="单任务线程:", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(side=tk.LEFT)
         th_v = tk.IntVar(value=self.default_threads)
-        th_spin = ttk.Spinbox(content_f, from_=1, to=32, textvariable=th_v, width=10, font=fnt_norm)
-        th_spin.pack(anchor="w", pady=(self.s(2), self.s(10)))
+        th_spin = ttk.Spinbox(th_box, from_=1, to=32, textvariable=th_v, width=5, font=fnt_norm, style="Dialog.TSpinbox")
+        th_spin.pack(side=tk.LEFT, padx=(self.s(4), self.s(14)))
 
-        # 5) 关闭主窗口时的行为
-        tk.Label(content_f, text="关闭主窗口时:", font=fnt_bold).pack(anchor="w")
-        close_box = tk.Frame(content_f)
-        close_box.pack(fill=tk.X, pady=row_py)
+        tk.Label(th_box, text="同时下载任务上限:", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(side=tk.LEFT)
+        conc_v = tk.IntVar(value=self._get_max_concurrent_tasks())
+        conc_spin = ttk.Spinbox(th_box, from_=1, to=10, textvariable=conc_v, width=5, font=fnt_norm, style="Dialog.TSpinbox")
+        conc_spin.pack(side=tk.LEFT, padx=(self.s(4), 0))
 
+        tk.Label(g2, text="限速与完成动作", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=2, column=0, sticky="w"
+        )
+        rate_box = tk.Frame(g2, bg=card_bg)
+        rate_box.grid(row=2, column=1, sticky="ew")
+        curr_kbps = int(self.history_mgr.settings.get("speed_limit_kbps", 0) or 0)
+        speed_disp = "0 (不限速)" if curr_kbps <= 0 else f"{curr_kbps}"
+        speed_v = tk.StringVar(value=speed_disp)
+        speed_combo = ttk.Combobox(
+            rate_box,
+            textvariable=speed_v,
+            values=["0 (不限速)", "512", "1024 (1 MB/s)", "2048 (2 MB/s)", "5120 (5 MB/s)", "10240 (10 MB/s)"],
+            font=fnt_norm,
+            width=15,
+            style="Dialog.TCombobox"
+        )
+        speed_combo.pack(side=tk.LEFT)
+        tk.Label(rate_box, text="KB/s", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(side=tk.LEFT, padx=(self.s(4), self.s(12)))
+
+        tk.Label(rate_box, text="全部完成后:", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(side=tk.LEFT)
+        curr_post = self.history_mgr.settings.get("post_download_action", "none")
+        post_rev = {
+            "none": "不执行操作",
+            "open_dir": "打开保存目录",
+            "shutdown": "自动关闭电脑"
+        }
+        post_v = tk.StringVar(value=post_rev.get(curr_post, "不执行操作"))
+        post_combo = ttk.Combobox(
+            rate_box,
+            textvariable=post_v,
+            values=["不执行操作", "打开保存目录", "自动关闭电脑"],
+            state="readonly",
+            font=fnt_norm,
+            width=13,
+            style="Dialog.TCombobox"
+        )
+        post_combo.pack(side=tk.LEFT, padx=(self.s(4), 0))
+
+        # ---------------- Card 3: 网络与代理 ----------------
+        g_net = make_card("🌐 网络与代理")
+
+        tk.Label(g_net, text="网络代理模式", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, self.s(6))
+        )
+        curr_pmode = self.history_mgr.settings.get("proxy_mode", "auto")
+        pmode_rev = {
+            "auto": "智能切换 (直连超时切系统代理)",
+            "system": "跟随并使用系统代理",
+            "direct": "直连模式 (禁用所有代理)",
+            "custom": "自定义代理 (HTTP / SOCKS5)"
+        }
+        pmode_v = tk.StringVar(value=pmode_rev.get(curr_pmode, pmode_rev["auto"]))
+        pmode_combo = ttk.Combobox(
+            g_net,
+            textvariable=pmode_v,
+            values=list(pmode_rev.values()),
+            state="readonly",
+            font=fnt_norm,
+            width=30,
+            style="Dialog.TCombobox"
+        )
+        pmode_combo.grid(row=0, column=1, sticky="w", pady=(0, self.s(6)))
+
+        tk.Label(g_net, text="自定义代理地址", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=1, column=0, sticky="w"
+        )
+        proxy_box = tk.Frame(g_net, bg=card_bg)
+        proxy_box.grid(row=1, column=1, sticky="ew")
+        proxy_addr_v = tk.StringVar(value=str(self.history_mgr.settings.get("custom_proxy", "") or ""))
+        proxy_entry = ttk.Entry(proxy_box, textvariable=proxy_addr_v, font=("Consolas", self.s(9)), style="Dialog.TEntry")
+        proxy_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(proxy_box, text="例: 127.0.0.1:7897 或 socks5h://127.0.0.1:10808", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(
+            side=tk.LEFT, padx=(self.s(8), 0)
+        )
+
+        def sync_proxy_entry_state(*_):
+            if "自定义代理" in pmode_v.get():
+                proxy_entry.configure(state="normal")
+            else:
+                proxy_entry.configure(state="readonly")
+
+        pmode_combo.bind("<<ComboboxSelected>>", sync_proxy_entry_state)
+        sync_proxy_entry_state()
+
+        # ---------------- Card 4: 系统与行为 ----------------
+        g3 = make_card("🖥️ 系统与行为")
+
+        tk.Label(g3, text="关闭主窗口时", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, self.s(6))
+        )
         curr_action = self.history_mgr.settings.get("close_action", "ask")
         action_map_rev = {
             "ask": "每次询问 (默认)",
@@ -2101,19 +3081,36 @@ class FlashGetApp(tk.Tk):
         }
         action_v = tk.StringVar(value=action_map_rev.get(curr_action, "每次询问 (默认)"))
         action_combo = ttk.Combobox(
-            close_box,
+            g3,
             textvariable=action_v,
             values=["每次询问 (默认)", "最小化到系统托盘", "直接退出程序"],
             state="readonly",
             font=fnt_norm,
-            width=22
+            width=22,
+            style="Dialog.TCombobox"
         )
-        action_combo.pack(side=tk.LEFT)
+        action_combo.grid(row=0, column=1, sticky="w", pady=(0, self.s(6)))
 
-        # 6) 数据与历史清理 (统一收纳到设置)
-        tk.Label(content_f, text="数据与历史清理:", font=fnt_bold).pack(anchor="w")
-        clean_box = tk.Frame(content_f)
-        clean_box.pack(fill=tk.X, pady=(self.s(2), self.s(6)))
+        tk.Label(g3, text="开机自启动", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=1, column=0, sticky="w"
+        )
+        autostart_v = tk.BooleanVar(value=bool(self.history_mgr.settings.get("auto_start", True)))
+        autostart_chk = ttk.Checkbutton(
+            g3,
+            text="Windows 登录时自动运行 FlashGet",
+            variable=autostart_v,
+            style="Card.TCheckbutton"
+        )
+        autostart_chk.grid(row=1, column=1, sticky="w")
+
+        # ---------------- Card 5: 数据维护 ----------------
+        g4 = make_card("🗂️ 数据维护", bottom_pad=0)
+
+        tk.Label(g4, text="历史记录清理", font=fnt_lbl, fg=t["fg"], bg=card_bg, anchor="w").grid(
+            row=0, column=0, sticky="w"
+        )
+        clean_box = tk.Frame(g4, bg=card_bg)
+        clean_box.grid(row=0, column=1, sticky="ew")
 
         def on_clean_history():
             if not self.history_mgr.tasks:
@@ -2121,13 +3118,13 @@ class FlashGetApp(tk.Tk):
                 return
             if messagebox.askyesno("清空历史记录", "确定要清空全部下载任务历史记录吗？\n（仅清理列表记录，绝不会删除本地已下载的文件）", parent=dialog):
                 self.stop_all_tasks()
-                for t in list(self.history_mgr.tasks):
-                    self.history_mgr.remove_task(t.id, delete_file=False)
+                for t_item in list(self.history_mgr.tasks):
+                    self.history_mgr.remove_task(t_item.id, delete_file=False)
                 self.refresh_table()
                 messagebox.showinfo("成功", "已成功清空所有下载历史记录！", parent=dialog)
 
         ttk.Button(clean_box, text="🧹 清空全部任务历史", command=on_clean_history, style="Dialog.TButton").pack(side=tk.LEFT)
-        tk.Label(clean_box, text="(仅清空列表记录，不会删除磁盘上的本地文件)", font=fnt_hint, fg="#94A3B8").pack(side=tk.LEFT, padx=(self.s(8), 0))
+        tk.Label(clean_box, text="仅清除列表记录，不删除本地文件", font=fnt_hint, fg=hint_fg, bg=card_bg).pack(side=tk.LEFT, padx=(self.s(8), 0))
 
         def save_conf():
             selected_th = "dark" if "暗黑" in theme_v.get() else "light"
@@ -2161,10 +3158,43 @@ class FlashGetApp(tk.Tk):
                 except Exception:
                     self.default_threads = 8
 
+            try:
+                raw_conc = conc_spin.get().strip()
+                conc_val = int(raw_conc) if raw_conc else conc_v.get()
+                conc_val = max(1, min(10, conc_val))
+            except Exception:
+                conc_val = 3
+
+            raw_speed = speed_v.get().strip().split()[0]
+            try:
+                speed_kbps = max(0, int(raw_speed))
+            except Exception:
+                speed_kbps = 0
+
+            post_map = {v: k for k, v in post_rev.items()}
+            pmode_map = {v: k for k, v in pmode_rev.items()}
+            chosen_pmode = pmode_map.get(pmode_v.get(), "auto")
+            chosen_proxy = normalize_proxy_url(proxy_addr_v.get()) if chosen_pmode == "custom" else proxy_addr_v.get().strip()
+
             # 持久化保存常规配置至本地历史与配置管理器
             self.history_mgr.settings["default_save_dir"] = self.default_save_dir
             self.history_mgr.settings["default_threads"] = self.default_threads
+            self.history_mgr.settings["max_concurrent_tasks"] = conc_val
+            self.history_mgr.settings["speed_limit_kbps"] = speed_kbps
+            self.history_mgr.settings["post_download_action"] = post_map.get(post_v.get(), "none")
+            self.history_mgr.settings["proxy_mode"] = chosen_pmode
+            self.history_mgr.settings["custom_proxy"] = chosen_proxy
+
+            want_autostart = bool(autostart_v.get())
+            ok_as, err_as = set_autostart(want_autostart)
+            if not ok_as:
+                messagebox.showwarning("提示", f"设置开机自启动失败: {err_as}", parent=dialog)
+            else:
+                self.history_mgr.settings["auto_start"] = want_autostart
             self.history_mgr.save()
+
+            self._sync_engine_runtime_settings()
+            self._process_download_queue()
 
             dialog.destroy()
 
@@ -2177,11 +3207,11 @@ class FlashGetApp(tk.Tk):
             else:
                 messagebox.showinfo("设置", "设置保存成功！", parent=self)
 
-        ttk.Button(btn_bar, text="确定", command=save_conf, style="Dialog.TButton").pack(side=tk.RIGHT)
-        ttk.Button(btn_bar, text="取消", command=dialog.destroy, style="Dialog.TButton").pack(side=tk.RIGHT, padx=self.s(6))
+        ttk.Button(btn_bar, text="确定", command=save_conf, style="Accent.TButton").pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="取消", command=dialog.destroy, style="Dialog.TButton").pack(side=tk.RIGHT, padx=self.s(8))
 
         # 自动计算所需空间，绝无遮挡截断
-        setup_dialog_geometry(dialog, self, min_width=520, min_height=500, scale_func=self.s)
+        setup_dialog_geometry(dialog, self, min_width=640, min_height=560, scale_func=self.s)
 
     # ================= 8. System Tray & Window Close Handlers =================
     def _init_system_tray(self):
@@ -2206,14 +3236,34 @@ class FlashGetApp(tk.Tk):
             print(f"[Tray] Init tray failed: {e}")
 
     def restore_from_tray(self):
-        """从系统托盘恢复显示并激活主窗口"""
+        """从系统托盘或最小化状态恢复显示并置顶激活主窗口"""
         def _do():
+            try:
+                if self.state() == "iconic":
+                    self.state("normal")
+            except Exception:
+                pass
             self.deiconify()
             self.attributes("-topmost", True)
             self.update_idletasks()
             self.attributes("-topmost", False)
             self.lift()
             self.focus_force()
+            if sys.platform == "win32":
+                try:
+                    hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            # 若存在子弹窗（如设置或新建任务窗），同步置顶
+            for child in self.winfo_children():
+                if isinstance(child, tk.Toplevel):
+                    try:
+                        if child.winfo_viewable():
+                            child.lift()
+                    except Exception:
+                        pass
         self.after(0, _do)
 
     def minimize_to_tray(self):
@@ -2283,8 +3333,8 @@ class FlashGetApp(tk.Tk):
             bg=self.theme["bg"]
         ).pack(side=tk.LEFT)
 
-        box_bg = self.theme["table_row2"] if self.theme["is_dark"] else "#F3F4F6"
-        opt_f = tk.Frame(pad_f, bg=box_bg, bd=1, relief="solid", highlightthickness=1, highlightbackground=self.theme["border"])
+        box_bg = self.theme["card_bg"]
+        opt_f = tk.Frame(pad_f, bg=box_bg, bd=0, highlightthickness=1, highlightbackground=self.theme["border"])
         opt_f.pack(fill=tk.X, pady=(0, self.s(12)), ipady=self.s(6), ipadx=self.s(8))
 
         choice_var = tk.StringVar(value="tray")
@@ -2330,7 +3380,7 @@ class FlashGetApp(tk.Tk):
         def on_cancel():
             dialog.destroy()
 
-        ttk.Button(btn_bar, text="确定", command=on_ok, width=10, style="Dialog.TButton").pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="确定", command=on_ok, width=10, style="Accent.TButton").pack(side=tk.RIGHT)
         ttk.Button(btn_bar, text="取消", command=on_cancel, width=10, style="Dialog.TButton").pack(side=tk.RIGHT, padx=self.s(8))
 
         setup_dialog_geometry(dialog, self, min_width=440, min_height=240, scale_func=self.s)
@@ -2350,7 +3400,70 @@ class FlashGetApp(tk.Tk):
         sys.exit(0)
 
 
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def acquire_single_instance_mutex():
+    """在 Windows 下创建全局单实例互斥锁。若已存在运行实例返回 False，否则返回 True。"""
+    global _SINGLE_INSTANCE_MUTEX
+    if sys.platform != "win32":
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, "Local\\FlashGet_SingleInstance_Mutex_v1")
+        if not handle:
+            return True
+        last_err = kernel32.GetLastError()
+        _SINGLE_INSTANCE_MUTEX = handle
+        if last_err == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def notify_existing_instance():
+    """唤醒并置顶已在运行的 FlashGet 主窗口。"""
+    if sys.platform == "win32":
+        try:
+            # 允许后台旧进程主动抢占前台焦点
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)
+        except Exception:
+            pass
+
+    import urllib.request
+    for _ in range(5):
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:9666/focus",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            time.sleep(0.1)
+
+    # 端口未响应时的系统窗口句柄兜底激活
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.FindWindowW(None, "FlashGet 极速多线程下载器")
+            if hwnd:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def main():
+    if not acquire_single_instance_mutex():
+        notify_existing_instance()
+        sys.exit(0)
     app = FlashGetApp()
     app.mainloop()
 

@@ -65,7 +65,7 @@ class DownloadTask:
             "threads": self.threads,
             "custom_cookies": self.custom_cookies,
             "custom_referer": self.custom_referer,
-            "status": "paused" if self.status == "downloading" else self.status,
+            "status": "paused" if self.status in ("downloading", "queued") else self.status,
             "created_at": self.created_at,
             "error_msg": self.error_msg
         }
@@ -148,7 +148,13 @@ class HistoryManager:
             "ui_scale": 100,
             "default_threads": 8,
             "default_save_dir": os.path.join(os.path.expanduser("~"), "Downloads"),
-            "close_action": "ask"  # ask, tray, exit
+            "close_action": "ask",  # ask, tray, exit
+            "auto_start": True,
+            "max_concurrent_tasks": 3,
+            "speed_limit_kbps": 0,  # 0 = 不限速
+            "proxy_mode": "auto",  # auto, system, direct, custom
+            "custom_proxy": "",
+            "post_download_action": "none"  # none, open_dir, shutdown
         }
         self.load()
 

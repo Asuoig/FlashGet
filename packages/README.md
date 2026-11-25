@@ -35,6 +35,6 @@ packages/
   2. 双击运行 `packages\build_all_packages.bat`，即可自动更新便携版目录并重新生成 ZIP 归档。
 
 ### 2. 修改安装包 (Installer)
-* **修改安装向导界面/逻辑**：直接编辑 [installer/installer_source.py](file:///C:/Users/Fang/.gemini/antigravity/scratch/multithread_downloader/packages/installer/installer_source.py)
-* **修改卸载清理逻辑**：直接编辑 [installer/uninstaller_source.py](file:///C:/Users/Fang/.gemini/antigravity/scratch/multithread_downloader/packages/installer/uninstaller_source.py)
+* **修改安装向导界面/逻辑**：直接编辑 [installer/installer_source.py](installer/installer_source.py)
+* **修改卸载清理逻辑**：直接编辑 [installer/uninstaller_source.py](installer/uninstaller_source.py)
 * **重新编译安装包**：在 `packages\installer` 目录下运行 `python build_installer.py`，即可重新输出最新的 `FlashGet_Setup.exe`。

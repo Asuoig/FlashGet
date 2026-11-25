@@ -15,12 +15,16 @@ import sys
 import time
 import json
 import ssl
+import socket
+import struct
+import hashlib
+import http.client
 import http.cookiejar
 import urllib.request
 import urllib.parse
 import urllib.error
 import threading
-from typing import Callable, Optional, Dict, List, Any
+from typing import Callable, Optional, Dict, List, Any, Tuple
 
 
 def format_bytes(size_bytes: float) -> str:
@@ -82,6 +86,224 @@ def repair_mojibake_filename(name: str) -> str:
     return name
 
 
+def compute_file_hashes(
+    file_path: str,
+    algorithms: Tuple[str, ...] = ("md5", "sha1", "sha256"),
+    chunk_size: int = 1024 * 1024,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None
+) -> Dict[str, str]:
+    """Single-pass streaming file checksum computation (supports MD5, SHA-1, SHA-256)."""
+    if not file_path or not os.path.isfile(file_path):
+        raise FileNotFoundError(f"文件不存在: {file_path}")
+
+    hashers = {}
+    for alg in algorithms:
+        name = alg.lower().strip()
+        if name == "md5":
+            hashers["md5"] = hashlib.md5()
+        elif name == "sha1":
+            hashers["sha1"] = hashlib.sha1()
+        elif name == "sha256":
+            hashers["sha256"] = hashlib.sha256()
+        else:
+            hashers[name] = hashlib.new(name)
+
+    total_size = os.path.getsize(file_path)
+    processed = 0
+    if on_progress:
+        on_progress(0, total_size)
+
+    with open(file_path, "rb") as f:
+        while True:
+            if cancel_event and cancel_event.is_set():
+                return {}
+            buf = f.read(chunk_size)
+            if not buf:
+                break
+            for h in hashers.values():
+                h.update(buf)
+            processed += len(buf)
+            if on_progress:
+                on_progress(processed, total_size)
+
+    return {k: h.hexdigest() for k, h in hashers.items()}
+
+
+class GlobalRateLimiter:
+    """Thread-safe shared token-bucket rate limiter across all concurrent downloads."""
+
+    def __init__(self, limit_kbps: int = 0):
+        self._lock = threading.Lock()
+        self._limit_kbps = 0
+        self._bytes_per_sec = 0.0
+        self._max_tokens = 0.0
+        self._tokens = 0.0
+        self._last_time = time.monotonic()
+        self.set_limit_kbps(limit_kbps)
+
+    @property
+    def limit_kbps(self) -> int:
+        return self._limit_kbps
+
+    @property
+    def bytes_per_sec(self) -> float:
+        return self._bytes_per_sec
+
+    def set_limit_kbps(self, limit_kbps: int):
+        with self._lock:
+            val = max(0, int(limit_kbps or 0))
+            self._limit_kbps = val
+            self._bytes_per_sec = float(val * 1024) if val > 0 else 0.0
+            self._max_tokens = max(65536.0, self._bytes_per_sec * 0.5) if self._bytes_per_sec > 0 else 0.0
+            self._tokens = self._max_tokens
+            self._last_time = time.monotonic()
+
+    def acquire(
+        self,
+        num_bytes: int,
+        cancel_event: Optional[threading.Event] = None,
+        pause_event: Optional[threading.Event] = None
+    ):
+        if num_bytes <= 0 or self._bytes_per_sec <= 0.0:
+            return
+
+        with self._lock:
+            bps = self._bytes_per_sec
+            if bps <= 0.0:
+                return
+            now = time.monotonic()
+            elapsed = max(0.0, now - self._last_time)
+            self._last_time = now
+            self._tokens = min(self._max_tokens, self._tokens + elapsed * bps)
+            self._tokens -= float(num_bytes)
+            deficit = -self._tokens if self._tokens < 0.0 else 0.0
+            sleep_total = (deficit / bps) if deficit > 0.0 else 0.0
+
+        if sleep_total > 0.001:
+            end_time = time.monotonic() + sleep_total
+            while True:
+                if (cancel_event and cancel_event.is_set()) or (pause_event and pause_event.is_set()):
+                    return
+                rem = end_time - time.monotonic()
+                if rem <= 0:
+                    break
+                time.sleep(min(0.05, rem))
+
+
+GLOBAL_RATE_LIMITER = GlobalRateLimiter(0)
+
+
+def normalize_proxy_url(proxy_str: str) -> str:
+    """Normalize user-entered proxy string such as '127.0.0.1:7897' into a URL."""
+    raw = (proxy_str or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        return f"http://{raw}"
+    return raw
+
+
+def _socks5_connect(proxy_host: str, proxy_port: int, dest_host: str, dest_port: int, timeout: float = 15.0, username: Optional[str] = None, password: Optional[str] = None) -> socket.socket:
+    """Pure-stdlib RFC 1928 SOCKS5 TCP tunnel connector (supports optional username/password auth)."""
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        methods = b"\x00\x02" if (username is not None and password is not None) else b"\x00"
+        sock.sendall(struct.pack("!BB", 5, len(methods)) + methods)
+        resp = sock.recv(2)
+        if len(resp) < 2 or resp[0] != 5:
+            raise OSError("SOCKS5 代理握手响应无效")
+        chosen = resp[1]
+        if chosen == 0xFF:
+            raise OSError("SOCKS5 代理拒绝认证方式")
+        if chosen == 0x02:
+            if username is None or password is None:
+                raise OSError("SOCKS5 代理需要用户名和密码认证")
+            u_b = username.encode("utf-8")
+            p_b = password.encode("utf-8")
+            sock.sendall(struct.pack("!BB", 1, len(u_b)) + u_b + struct.pack("!B", len(p_b)) + p_b)
+            auth_resp = sock.recv(2)
+            if len(auth_resp) < 2 or auth_resp[1] != 0:
+                raise OSError("SOCKS5 代理用户名或密码错误")
+
+        host_bytes = dest_host.encode("idna")
+        req_pkt = struct.pack("!BBBB", 5, 1, 0, 3) + struct.pack("!B", len(host_bytes)) + host_bytes + struct.pack("!H", int(dest_port))
+        sock.sendall(req_pkt)
+
+        hdr = sock.recv(4)
+        if len(hdr) < 4 or hdr[1] != 0:
+            code = hdr[1] if len(hdr) >= 2 else -1
+            raise OSError(f"SOCKS5 连接目标失败 (错误码: {code})")
+        atyp = hdr[3]
+        if atyp == 1:
+            sock.recv(6)
+        elif atyp == 3:
+            ln = sock.recv(1)
+            if ln:
+                sock.recv(ln[0] + 2)
+        elif atyp == 4:
+            sock.recv(18)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise
+
+
+class _Socks5ProxyHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, proxy_url: str):
+        super().__init__()
+        self._p = urllib.parse.urlparse(proxy_url)
+
+    def http_open(self, req):
+        p = self._p
+        class _Conn(http.client.HTTPConnection):
+            def connect(self_conn):
+                self_conn.sock = _socks5_connect(
+                    p.hostname or "127.0.0.1",
+                    p.port or 1080,
+                    self_conn.host,
+                    self_conn.port,
+                    timeout=self_conn.timeout or 15.0,
+                    username=urllib.parse.unquote(p.username) if p.username else None,
+                    password=urllib.parse.unquote(p.password) if p.password else None,
+                )
+        return self.do_open(_Conn, req)
+
+
+class _Socks5ProxyHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, proxy_url: str, context=None):
+        super().__init__(context=context)
+        self._p = urllib.parse.urlparse(proxy_url)
+        self._ctx = context or ssl.create_default_context()
+
+    def https_open(self, req):
+        p = self._p
+        ctx = self._ctx
+        class _Conn(http.client.HTTPSConnection):
+            def connect(self_conn):
+                raw_sock = _socks5_connect(
+                    p.hostname or "127.0.0.1",
+                    p.port or 1080,
+                    self_conn.host,
+                    self_conn.port,
+                    timeout=self_conn.timeout or 15.0,
+                    username=urllib.parse.unquote(p.username) if p.username else None,
+                    password=urllib.parse.unquote(p.password) if p.password else None,
+                )
+                self_conn.sock = ctx.wrap_socket(raw_sock, server_hostname=self_conn.host)
+        return self.do_open(lambda host, **kw: _Conn(host, context=ctx, **kw), req)
+
+
+# Global runtime proxy configuration updated by GUI Settings
+GLOBAL_PROXY_CONFIG = {
+    "mode": "auto",  # auto, system, direct, custom
+    "custom_proxy": ""
+}
+
+
 class ChunkTask:
     """Represents a single range chunk downloaded by a worker thread."""
     def __init__(self, chunk_id: int, start: int, end: int, downloaded: int = 0):
@@ -136,7 +358,10 @@ class DownloadEngine:
         custom_referer: Optional[str] = None,
         on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_status_change: Optional[Callable[[str, str], None]] = None,
-        on_chunk_progress: Optional[Callable[[int, int, int], None]] = None
+        on_chunk_progress: Optional[Callable[[int, int, int], None]] = None,
+        rate_limiter: Optional[GlobalRateLimiter] = None,
+        proxy_mode: Optional[str] = None,
+        custom_proxy: Optional[str] = None
     ):
         self.url = url.strip()
         self.save_dir = os.path.abspath(save_dir)
@@ -147,6 +372,9 @@ class DownloadEngine:
         self.on_progress = on_progress
         self.on_status_change = on_status_change
         self.on_chunk_progress = on_chunk_progress
+        self.rate_limiter = rate_limiter if rate_limiter is not None else GLOBAL_RATE_LIMITER
+        self.proxy_mode = (proxy_mode or GLOBAL_PROXY_CONFIG.get("mode", "auto")).lower()
+        self.custom_proxy = custom_proxy if custom_proxy is not None else GLOBAL_PROXY_CONFIG.get("custom_proxy", "")
 
         self.filename = ""
         self.final_file_path = ""
@@ -176,34 +404,78 @@ class DownloadEngine:
         self.use_proxy = False
         self._init_network_openers()
 
+    def _build_opener_for_proxy(self, ssl_ctx, proxy_spec=None):
+        """Build a urllib opener for direct ({}), dict system proxies, or HTTP/SOCKS5 custom proxy."""
+        if proxy_spec is None:
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=ssl_ctx),
+                urllib.request.HTTPCookieProcessor(self.cookie_jar)
+            )
+        if isinstance(proxy_spec, str):
+            p_url = normalize_proxy_url(proxy_spec)
+            if not p_url:
+                return None
+            scheme = urllib.parse.urlparse(p_url).scheme.lower()
+            if scheme in ("socks5", "socks5h", "socks"):
+                return urllib.request.build_opener(
+                    _Socks5ProxyHTTPHandler(p_url),
+                    _Socks5ProxyHTTPSHandler(p_url, context=ssl_ctx),
+                    urllib.request.HTTPCookieProcessor(self.cookie_jar)
+                )
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": p_url, "https": p_url}),
+                urllib.request.HTTPSHandler(context=ssl_ctx),
+                urllib.request.HTTPCookieProcessor(self.cookie_jar)
+            )
+        if isinstance(proxy_spec, dict) and proxy_spec:
+            # Handle socks-only Windows system proxy gracefully
+            if "http" not in proxy_spec and "https" not in proxy_spec:
+                socks_ep = proxy_spec.get("socks") or proxy_spec.get("socks5")
+                if socks_ep:
+                    return self._build_opener_for_proxy(ssl_ctx, f"socks5h://{socks_ep}" if "://" not in socks_ep else socks_ep)
+            return urllib.request.build_opener(
+                urllib.request.ProxyHandler(proxy_spec),
+                urllib.request.HTTPSHandler(context=ssl_ctx),
+                urllib.request.HTTPCookieProcessor(self.cookie_jar)
+            )
+        return None
+
+    def _rebuild_openers(self, ssl_ctx):
+        self.direct_opener = self._build_opener_for_proxy(ssl_ctx, None)
+        self.proxy_opener = None
+
+        if self.proxy_mode == "direct":
+            self.use_proxy = False
+            return
+
+        if self.proxy_mode == "custom":
+            try:
+                self.proxy_opener = self._build_opener_for_proxy(ssl_ctx, self.custom_proxy)
+            except Exception:
+                self.proxy_opener = None
+            if self.proxy_opener is not None:
+                self.use_proxy = True
+            return
+
+        system_proxies = urllib.request.getproxies()
+        if system_proxies:
+            try:
+                self.proxy_opener = self._build_opener_for_proxy(ssl_ctx, system_proxies)
+            except Exception:
+                self.proxy_opener = None
+
+        if self.proxy_mode == "system" and self.proxy_opener is not None:
+            self.use_proxy = True
+
     def _init_network_openers(self):
-        """Initialize SSL contexts and CookieJar-enabled openers with auto proxy fallback."""
-        # 默认使用安全 SSL 上下文（校验证书），仅在遇到证书错误时降级
+        """Initialize SSL contexts and CookieJar-enabled openers honoring configured proxy mode."""
         self.ssl_ctx = ssl.create_default_context()
-        # Fallback insecure context — only used after an SSL verification failure
         self._insecure_ssl_ctx = ssl.create_default_context()
         self._insecure_ssl_ctx.check_hostname = False
         self._insecure_ssl_ctx.verify_mode = ssl.CERT_NONE
         self._using_insecure_ssl = False
-
-        # 1. Direct opener with CookieJar
-        self.direct_opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=self.ssl_ctx),
-            urllib.request.HTTPCookieProcessor(self.cookie_jar)
-        )
-
-        # 2. Proxy-capable opener (auto-detects Windows system proxy or local proxies)
-        self.proxy_opener = None
-        system_proxies = urllib.request.getproxies()
-        if system_proxies:
-            try:
-                self.proxy_opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler(system_proxies),
-                    urllib.request.HTTPSHandler(context=self.ssl_ctx),
-                    urllib.request.HTTPCookieProcessor(self.cookie_jar)
-                )
-            except Exception:
-                pass
+        self._rebuild_openers(self.ssl_ctx)
 
     def set_status(self, status: str, message: str = ""):
         self.status = status
@@ -250,22 +522,11 @@ class DownloadEngine:
             if not self._using_insecure_ssl:
                 self._using_insecure_ssl = True
                 self.set_status(self.status, "⚠️ SSL证书校验失败，已降级为不验证模式（存在安全风险）")
-                # Rebuild openers with insecure context
-                self.direct_opener = urllib.request.build_opener(
-                    urllib.request.HTTPSHandler(context=self._insecure_ssl_ctx),
-                    urllib.request.HTTPCookieProcessor(self.cookie_jar)
-                )
-                if self.proxy_opener is not None:
-                    system_proxies = urllib.request.getproxies()
-                    self.proxy_opener = urllib.request.build_opener(
-                        urllib.request.ProxyHandler(system_proxies),
-                        urllib.request.HTTPSHandler(context=self._insecure_ssl_ctx),
-                        urllib.request.HTTPCookieProcessor(self.cookie_jar)
-                    )
-            reopener = self.proxy_opener if self.use_proxy else self.direct_opener
+                self._rebuild_openers(self._insecure_ssl_ctx)
+            reopener = (self.proxy_opener or self.direct_opener) if self.use_proxy else self.direct_opener
             return reopener.open(req, timeout=timeout)
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            if fallback_opener is not None:
+            if self.proxy_mode == "auto" and fallback_opener is not None:
                 self.use_proxy = True
                 self.set_status(self.status, "直连超时，已自动静默切换至系统代理重试...")
                 return fallback_opener.open(req, timeout=timeout)
@@ -664,11 +925,14 @@ class DownloadEngine:
                                 return
 
                             read_limit = self.BUFFER_SIZE
+                            bps = self.rate_limiter.bytes_per_sec if self.rate_limiter else 0.0
+                            if bps > 0:
+                                read_limit = min(read_limit, max(4096, int(bps / 4)))
                             if expected_total > 0:
                                 remaining = expected_total - chunk.downloaded
                                 if remaining <= 0:
                                     break
-                                read_limit = min(self.BUFFER_SIZE, remaining)
+                                read_limit = min(read_limit, remaining)
 
                             buffer = response.read(read_limit)
                             if not buffer:
@@ -676,6 +940,8 @@ class DownloadEngine:
 
                             f.write(buffer)
                             chunk.downloaded += len(buffer)
+                            if self.rate_limiter:
+                                self.rate_limiter.acquire(len(buffer), self._cancel_event, self._pause_event)
 
                             if self.on_chunk_progress:
                                 self.on_chunk_progress(chunk.chunk_id, chunk.downloaded, chunk.total_bytes)

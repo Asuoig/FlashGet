@@ -4,13 +4,25 @@ Unit tests for FlashGet Download Engine and History Manager.
 
 import os
 import sys
+import time
+import hashlib
+import threading
 import unittest
 import tempfile
 
 # Ensure parent directory is in module path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine import DownloadEngine, ChunkTask, format_bytes, format_time, repair_mojibake_filename
+from engine import (
+    DownloadEngine,
+    ChunkTask,
+    GlobalRateLimiter,
+    compute_file_hashes,
+    normalize_proxy_url,
+    format_bytes,
+    format_time,
+    repair_mojibake_filename,
+)
 from history_manager import HistoryManager, DownloadTask
 
 
@@ -61,6 +73,47 @@ class TestDownloadEngine(unittest.TestCase):
         # ASCII / clean text untouched
         self.assertEqual(repair_mojibake_filename("normal_file.zip"), "normal_file.zip")
 
+    def test_compute_file_hashes(self):
+        sample_path = os.path.join(self.temp_dir.name, "sample.bin")
+        payload = b"FlashGet-Integrity-Test-Payload-" * 1024
+        with open(sample_path, "wb") as f:
+            f.write(payload)
+
+        res = compute_file_hashes(sample_path, ("md5", "sha1", "sha256"), chunk_size=4096)
+        self.assertEqual(res["md5"], hashlib.md5(payload).hexdigest())
+        self.assertEqual(res["sha1"], hashlib.sha1(payload).hexdigest())
+        self.assertEqual(res["sha256"], hashlib.sha256(payload).hexdigest())
+
+        ev = threading.Event()
+        ev.set()
+        self.assertEqual(compute_file_hashes(sample_path, cancel_event=ev), {})
+
+    def test_global_rate_limiter(self):
+        limiter = GlobalRateLimiter(0)
+        t0 = time.monotonic()
+        limiter.acquire(1024 * 1024)
+        self.assertLess(time.monotonic() - t0, 0.1)
+
+        # Throttling with immediate cancel wakeup
+        limiter.set_limit_kbps(10)  # 10 KB/s
+        cancel_ev = threading.Event()
+        threading.Timer(0.05, cancel_ev.set).start()
+        t1 = time.monotonic()
+        limiter.acquire(1024 * 100, cancel_event=cancel_ev)
+        self.assertLess(time.monotonic() - t1, 0.5)
+
+    def test_proxy_modes_and_normalization(self):
+        self.assertEqual(normalize_proxy_url("127.0.0.1:7897"), "http://127.0.0.1:7897")
+        self.assertEqual(normalize_proxy_url("socks5h://127.0.0.1:10808"), "socks5h://127.0.0.1:10808")
+
+        eng_direct = DownloadEngine("http://example.com/a.zip", self.temp_dir.name, proxy_mode="direct")
+        self.assertFalse(eng_direct.use_proxy)
+        self.assertIsNone(eng_direct.proxy_opener)
+
+        eng_socks = DownloadEngine("http://example.com/a.zip", self.temp_dir.name, proxy_mode="custom", custom_proxy="socks5h://127.0.0.1:10808")
+        self.assertTrue(eng_socks.use_proxy)
+        self.assertIsNotNone(eng_socks.proxy_opener)
+
 
 class TestHistoryManager(unittest.TestCase):
     def setUp(self):
@@ -97,6 +150,16 @@ class TestHistoryManager(unittest.TestCase):
         self.assertEqual(len(self.hm.tasks), 0)
         self.assertFalse(os.path.exists(part0))
         self.assertFalse(os.path.exists(dmeta))
+
+    def test_queue_and_settings_defaults(self):
+        self.assertEqual(self.hm.settings.get("max_concurrent_tasks"), 3)
+        self.assertEqual(self.hm.settings.get("speed_limit_kbps"), 0)
+        self.assertEqual(self.hm.settings.get("proxy_mode"), "auto")
+        self.assertEqual(self.hm.settings.get("post_download_action"), "none")
+
+        q_task = DownloadTask("http://example.com/q.zip", self.temp_dir.name, "q.zip")
+        q_task.status = "queued"
+        self.assertEqual(q_task.to_dict()["status"], "paused")
 
 
 if __name__ == "__main__":
